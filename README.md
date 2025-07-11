@@ -32,9 +32,9 @@ The statistical methodology implemented in this package is based on:
 
 ### **Python Implementation**
 **PyMVNMLE Development Team**:
-- Lead Developer: [Your Name]
-- Institution: [Your University/Organization]
-- Contact: [Your Email]
+- Lead Developer: Hai-Shuo Shu
+- Institution: University of Massachusetts - Dartmouth
+- Contact: hshu@umassd.edu
 
 ---
 
@@ -270,9 +270,9 @@ If you use PyMVNMLE in your research, please cite:
 
 ```bibtex
 @software{pymvnmle2024,
-  author = {[Your Name]},
+  author = {Hai-Shuo Shu},
   title = {PyMVNMLE: GPU-Accelerated Maximum Likelihood Estimation for Multivariate Normal Data with Missing Values},
-  year = {2024},
+  year = {2025},
   url = {https://github.com/yourusername/pymvnmle},
   note = {Python implementation based on R mvnmle package by Kevin Gross}
 }

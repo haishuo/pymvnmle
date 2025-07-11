@@ -261,7 +261,7 @@ def test_apple_dataset():
 - **Performance guide**: Optimization tips for large datasets
 
 ### **Getting Help**
-- **GitHub Issues**: [github.com/yourusername/pymvnmle/issues](https://github.com/yourusername/pymvnmle/issues)
+- **GitHub Issues**: [github.com/haishuo/pymvnmle/issues](https://github.com/yourusername/pymvnmle/issues)
 - **Discussions**: Community Q&A and feature requests
 - **Examples**: Comprehensive notebook collection
 
@@ -273,7 +273,7 @@ If you use PyMVNMLE in your research, please cite:
   author = {Hai-Shuo Shu},
   title = {PyMVNMLE: GPU-Accelerated Maximum Likelihood Estimation for Multivariate Normal Data with Missing Values},
   year = {2025},
-  url = {https://github.com/yourusername/pymvnmle},
+  url = {https://github.com/haishuo/pymvnmle},
   note = {Python implementation based on R mvnmle package by Kevin Gross}
 }
 ```
@@ -295,7 +295,7 @@ If you use PyMVNMLE in your research, please cite:
 
 ### **Development Installation**
 ```bash
-git clone https://github.com/yourusername/pymvnmle.git
+git clone https://github.com/haishuo/pymvnmle.git
 cd pymvnmle
 pip install -e .[dev,all]
 ```
@@ -379,7 +379,7 @@ This project is inspired by and ports algorithms from the R `mvnmle` package (GP
 
 If PyMVNMLE has helped your research, please consider giving it a star! ⭐
 
-[![Star History Chart](https://api.star-history.com/svg?repos=yourusername/pymvnmle&type=Date)](https://star-history.com/#yourusername/pymvnmle&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=haishuo/pymvnmle&type=Date)](https://star-history.com/#haishuo/pymvnmle&Date)
 
 ---
 

@@ -1,22 +1,31 @@
 from pymvnmle._backends import print_backend_summary, get_available_backends
+import platform
 
-# Fixed CuPy test:
-import cupy as cp
-print("CuPy version:", cp.__version__)
-device_count = cp.cuda.runtime.getDeviceCount()
-print("CUDA devices:", device_count)
+# Check if we're on Mac to skip CuPy test
+is_mac = platform.system() == 'Darwin'
 
-for i in range(device_count):
-    with cp.cuda.Device(i):
-        props = cp.cuda.runtime.getDeviceProperties(i)
-        # Use the correct memory info API
-        mempool = cp.get_default_memory_pool()
-        print(f"GPU {i}: {props['name'].decode()}")
-        print(f"  Compute capability: {props['major']}.{props['minor']}")
-        print(f"  Total memory: {props['totalGlobalMem'] // 1024**3} GB")
+if not is_mac:
+    # Only test CuPy on non-Mac systems
+    try:
+        import cupy as cp
+        print("CuPy version:", cp.__version__)
+        device_count = cp.cuda.runtime.getDeviceCount()
+        print("CUDA devices:", device_count)
+
+        for i in range(device_count):
+            with cp.cuda.Device(i):
+                props = cp.cuda.runtime.getDeviceProperties(i)
+                print(f"GPU {i}: {props['name'].decode()}")
+                print(f"  Compute capability: {props['major']}.{props['minor']}")
+                print(f"  Total memory: {props['totalGlobalMem'] // 1024**3} GB")
+    except ImportError:
+        print("CuPy not available (expected on Mac)")
+else:
+    print("Running on Mac - CuPy not applicable (no NVIDIA GPUs)")
+
 print("==================================================")
-print_backend_summary()  # See what's available on your system
-print(get_available_backends())  # Should show at least ['numpy']
+print_backend_summary()
+print(get_available_backends())
 
 print("\n🔥 CPU vs GPU Performance:")
 from pymvnmle._backends import benchmark_backends

@@ -22,7 +22,7 @@ print("\n🔥 CPU (Intel MKL) vs GPU (RTX 5070 Ti) Performance:")
 from pymvnmle._backends import benchmark_backends
 
 # Test different matrix sizes
-for size in [500, 1000, 2000, 3000]:
+for size in [500, 1000, 2000, 3000, 5000, 8000, 10000]:
     print(f"\nMatrix {size}×{size}:")
     times = benchmark_backends(matrix_size=size, operation='cholesky')
     
@@ -32,7 +32,7 @@ for size in [500, 1000, 2000, 3000]:
         speedup = numpy_time / cupy_time
         
         print(f"  Intel MKL (CPU): {numpy_time:.3f}s")
-        print(f"  RTX 5070 Ti:      {cupy_time:.3f}s")
+        print(f"  RTX 5070 Ti(GPU): {cupy_time:.3f}s")
         print(f"  GPU Speedup:      {speedup:.1f}x")
     else:
         print(f"  Times: {times}")

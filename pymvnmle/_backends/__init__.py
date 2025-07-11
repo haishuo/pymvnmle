@@ -245,11 +245,11 @@ def select_optimal_backend(data_shape: Tuple[int, int],
     
     # Large problems: GPU strongly preferred
     elif n_vars > 50 or n_obs > 1000:
-        # For very large problems, prefer JAX > CuPy > Metal
+        # For very large problems, JAX is generally best
         if n_vars > 200 and 'jax' in available_backends:
             return 'jax'  # JAX best for massive problems
         
-        # Otherwise use intelligent GPU preference
+        # Otherwise use intelligent GPU preference (JAX > CuPy > Metal)
         for backend in gpu_preference:
             if backend in available_backends:
                 return backend
@@ -266,6 +266,13 @@ def _get_gpu_backend_preference() -> List[str]:
     -------
     List[str]
         Ordered list of preferred GPU backends
+        
+    Notes
+    -----
+    Preference order based on performance testing:
+    1. JAX: Best performance via XLA compilation, excellent new GPU support
+    2. CuPy: Mature ecosystem, good for older GPUs  
+    3. Metal: Apple Silicon support
     """
     # Check if we have NVIDIA GPU and its compute capability
     cupy_info = _check_cupy_compatibility()
@@ -274,18 +281,18 @@ def _get_gpu_backend_preference() -> List[str]:
         max_compute_cap = max(cupy_info['compute_caps'])
         
         if max_compute_cap >= 12.0:
-            # Newer GPU (RTX 5000 series) - prefer JAX over CuPy
+            # Newer GPU (RTX 5000 series) - strongly prefer JAX
             if cupy_info['gpu_compatible']:
-                # CuPy works on this new GPU
-                return ['cupy', 'jax', 'metal']
+                # CuPy works but JAX performs better
+                return ['jax', 'cupy', 'metal']
             else:
-                # CuPy doesn't work on this new GPU, prefer JAX
+                # CuPy doesn't work, JAX is the only option
                 return ['jax', 'metal', 'cupy']
         else:
-            # Older GPU (RTX 4000 and below) - CuPy should work well
-            return ['cupy', 'jax', 'metal']
+            # Older GPU (RTX 4000 and below) - JAX still preferred but CuPy viable
+            return ['jax', 'cupy', 'metal']
     
-    # No NVIDIA GPU detected, or CuPy unavailable
+    # No NVIDIA GPU detected, or CuPy unavailable - prioritize JAX for any GPU
     return ['jax', 'metal', 'cupy']
 
 
@@ -566,6 +573,8 @@ def print_backend_summary():
         print(f"\nGPU Detection: Compute capability {max_cc}")
         if max_cc >= 12.0 and not cupy_info['gpu_compatible']:
             print("  → Preferring JAX over CuPy for this GPU generation")
+        else:
+            print("  → JAX preferred over CuPy based on performance testing")
 
 
 # Initialize the module by trying to import optional backends

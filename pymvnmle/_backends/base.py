@@ -252,6 +252,10 @@ class BackendInterface(ABC):
         test_matrix = np.random.randn(matrix_size, matrix_size)
         test_matrix = test_matrix @ test_matrix.T  # Make positive definite
         
+        # For Metal backend, use float32 to avoid MPS dtype limitations
+        if self.name == "metal":
+            test_matrix = test_matrix.astype(np.float32)
+        
         # Convert to backend format
         backend_matrix = self.asarray(test_matrix)
         

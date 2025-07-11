@@ -86,8 +86,11 @@ class MetalBackend(BackendInterface):
             Cholesky factor as NumPy array
         """
         try:
+            # Convert to float32 (MPS doesn't support float64)
+            matrix_f32 = matrix.astype(np.float32)
+            
             # Convert to PyTorch tensor on Metal device
-            metal_tensor = self.torch.from_numpy(matrix).to(self.device)
+            metal_tensor = self.torch.from_numpy(matrix_f32).to(self.device)
             
             # PyTorch cholesky returns upper triangular by default
             if upper:
@@ -95,8 +98,8 @@ class MetalBackend(BackendInterface):
             else:
                 metal_result = self.torch.linalg.cholesky_ex(metal_tensor, upper=False)[0]
             
-            # Convert back to NumPy (automatically transfers from Metal to CPU)
-            return metal_result.cpu().numpy()
+            # Convert back to NumPy (keep float32 for consistency)
+            return metal_result.cpu().numpy().astype(np.float64)
             
         except RuntimeError as e:
             if "not positive definite" in str(e).lower() or "cholesky" in str(e).lower():
@@ -133,9 +136,13 @@ class MetalBackend(BackendInterface):
             Solution x as NumPy array
         """
         try:
+            # Convert to float32 (MPS doesn't support float64)
+            a_f32 = a.astype(np.float32)
+            b_f32 = b.astype(np.float32)
+            
             # Convert to PyTorch tensors on Metal device
-            metal_a = self.torch.from_numpy(a).to(self.device)
-            metal_b = self.torch.from_numpy(b).to(self.device)
+            metal_a = self.torch.from_numpy(a_f32).to(self.device)
+            metal_b = self.torch.from_numpy(b_f32).to(self.device)
             
             # Handle transpose options
             if trans == 'T':
@@ -150,8 +157,8 @@ class MetalBackend(BackendInterface):
                 metal_b, metal_a, upper=upper
             )[0]
             
-            # Convert back to NumPy
-            return metal_result.cpu().numpy()
+            # Convert back to NumPy and restore float64
+            return metal_result.cpu().numpy().astype(np.float64)
             
         except Exception as e:
             from .base import NumericalError
@@ -174,8 +181,11 @@ class MetalBackend(BackendInterface):
             Natural logarithm of absolute determinant
         """
         try:
+            # Convert to float32 (MPS doesn't support float64)
+            matrix_f32 = matrix.astype(np.float32)
+            
             # Convert to PyTorch tensor on Metal device
-            metal_tensor = self.torch.from_numpy(matrix).to(self.device)
+            metal_tensor = self.torch.from_numpy(matrix_f32).to(self.device)
             
             # Compute log-determinant
             sign, logdet = self.torch.linalg.slogdet(metal_tensor)
@@ -202,14 +212,17 @@ class MetalBackend(BackendInterface):
             Matrix inverse as NumPy array
         """
         try:
+            # Convert to float32 (MPS doesn't support float64)
+            matrix_f32 = matrix.astype(np.float32)
+            
             # Convert to PyTorch tensor on Metal device
-            metal_tensor = self.torch.from_numpy(matrix).to(self.device)
+            metal_tensor = self.torch.from_numpy(matrix_f32).to(self.device)
             
             # Compute inverse
             metal_result = self.torch.linalg.inv(metal_tensor)
             
-            # Convert back to NumPy
-            return metal_result.cpu().numpy()
+            # Convert back to NumPy and restore float64
+            return metal_result.cpu().numpy().astype(np.float64)
             
         except Exception as e:
             from .base import NumericalError
@@ -230,15 +243,19 @@ class MetalBackend(BackendInterface):
             Product a @ b as NumPy array
         """
         try:
+            # Convert to float32 (MPS doesn't support float64)
+            a_f32 = a.astype(np.float32)
+            b_f32 = b.astype(np.float32)
+            
             # Convert to PyTorch tensors on Metal device
-            metal_a = self.torch.from_numpy(a).to(self.device)
-            metal_b = self.torch.from_numpy(b).to(self.device)
+            metal_a = self.torch.from_numpy(a_f32).to(self.device)
+            metal_b = self.torch.from_numpy(b_f32).to(self.device)
             
             # Matrix multiplication
             metal_result = self.torch.matmul(metal_a, metal_b)
             
-            # Convert back to NumPy
-            return metal_result.cpu().numpy()
+            # Convert back to NumPy and restore float64
+            return metal_result.cpu().numpy().astype(np.float64)
             
         except Exception as e:
             raise ValueError(f"Metal matrix multiplication failed: {e}")

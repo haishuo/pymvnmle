@@ -127,6 +127,9 @@ wandb/
 data/
 datasets/
 
+# Exception: Allow reference data for testing
+!tests/references/*.json
+
 # IDE
 .vscode/settings.json
 .idea/

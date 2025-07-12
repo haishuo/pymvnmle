@@ -251,6 +251,9 @@ def test_apple_dataset():
     apple_data = datasets['apple']
     r_ref = load_r_reference('apple_reference.json')
     
+    # First diagnose at R's solution
+    theta_r, f_r, grad_r = diagnose_objective_at_r_solution(apple_data, r_ref)
+
     print(f"Data shape: {apple_data.shape}")
     print(f"Missing values: {np.sum(np.isnan(apple_data))}")
     
@@ -405,6 +408,81 @@ def test_numerical_stability():
     except Exception as e:
         print(f"  Handled gracefully: {e}")
 
+def diagnose_objective_at_r_solution(data: np.ndarray, r_result: Dict[str, Any]):
+    """
+    Diagnose objective function behavior at R's solution.
+    """
+    print("\n" + "="*60)
+    print("DIAGNOSTIC: Objective function at R solution")
+    print("="*60)
+    
+    # Create objective function
+    obj = MVNMLEObjective(data)
+    
+    # Reconstruct R's parameter vector
+    n_vars = data.shape[1]
+    
+    # Get R's Delta matrix from their solution
+    # R has Sigma = (Delta^-1)' (Delta^-1)
+    # So Delta^-1 = chol(Sigma)'
+    Sigma_r = np.array(r_result['sigmahat'])
+    L = np.linalg.cholesky(Sigma_r)  # Lower triangular
+    Delta_inv = L.T  # Upper triangular
+    Delta = np.linalg.inv(Delta_inv)
+    
+    # Pack into parameter vector
+    theta_r = np.zeros(obj.n_total_params)
+    theta_r[:n_vars] = r_result['muhat']
+    theta_r[n_vars:2*n_vars] = np.log(np.diag(Delta))
+    
+    idx = 2*n_vars
+    for j in range(1, n_vars):
+        for i in range(j):
+            theta_r[idx] = Delta[i, j]
+            idx += 1
+    
+    # Evaluate objective at R's solution
+    f_at_r = obj(theta_r)
+    print(f"Objective at R solution: {f_at_r:.6f}")
+    print(f"Expected (-2*loglik): {-2 * r_result['loglik']:.6f}")
+    print(f"Difference: {abs(f_at_r - (-2 * r_result['loglik'])):.2e}")
+    
+    # Check gradient at R's solution
+    grad_at_r = obj.gradient(theta_r)
+    grad_norm = np.linalg.norm(grad_at_r)
+    print(f"\nGradient norm at R solution: {grad_norm:.2e}")
+    print(f"Max gradient component: {np.max(np.abs(grad_at_r)):.2e}")
+    
+    # Check gradient with different step sizes
+    print("\nGradient finite difference check:")
+    for eps_scale in [1.0, 10.0, 100.0, 0.1, 0.01]:
+        eps = 1.49011612e-08 * eps_scale
+        
+        # Check one parameter
+        i = 0  # First mean parameter
+        h = eps * max(abs(theta_r[i]), 1.0)
+        
+        theta_plus = theta_r.copy()
+        theta_plus[i] += h
+        
+        f_plus = obj(theta_plus)
+        fd_grad = (f_plus - f_at_r) / h
+        
+        print(f"  eps_scale={eps_scale:6.2f}: FD grad[0]={fd_grad:12.6f}, "
+              f"Computed grad[0]={grad_at_r[0]:12.6f}, "
+              f"Diff={abs(fd_grad - grad_at_r[0]):.2e}")
+    
+    # Test objective function smoothness
+    print("\nObjective function smoothness test:")
+    alphas = np.logspace(-10, -1, 10)
+    direction = -grad_at_r / grad_norm  # Descent direction
+    
+    for alpha in alphas:
+        theta_test = theta_r + alpha * direction
+        f_test = obj(theta_test)
+        print(f"  α={alpha:.2e}: f={f_test:.6f}, Δf={f_test - f_at_r:.6f}")
+    
+    return theta_r, f_at_r, grad_at_r
 
 def main():
     """Run all validation tests."""

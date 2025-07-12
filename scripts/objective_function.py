@@ -117,7 +117,178 @@ class MVNMLEObjective:
         # Iteration counter for diagnostics
         self.n_evaluations = 0
         self.n_gradient_evaluations = 0
+
+    def _apply_givens_rotations_exact(matrix, n_vars):
+        """Apply Givens rotations EXACTLY as R's evallf.c does."""
+        result = matrix.copy()
         
+        # R's algorithm: bottom-up, left-to-right
+        for i in range(n_vars-1, -1, -1):  # Start from bottom row
+            for j in range(i):  # Left to diagonal
+                # Zero out result[i, j] using Givens rotation
+                a = result[i, j]
+                b = result[i, j+1]
+                
+                # Skip if already small (R's exact threshold)
+                if abs(a) < 0.000001:
+                    result[i, j] = 0.0
+                    continue
+                
+                # Compute rotation parameters EXACTLY as R does
+                r = np.sqrt(a*a + b*b)
+                c = a / r
+                d = b / r
+                
+                # Apply rotation to entire matrix - compute all new values first
+                newcol1 = np.zeros(n_vars)
+                newcol2 = np.zeros(n_vars)
+                
+                for k in range(n_vars):
+                    newcol1[k] = d * result[k, j] - c * result[k, j+1]
+                    newcol2[k] = c * result[k, j] + d * result[k, j+1]
+                
+                # Update the matrix
+                for k in range(n_vars):
+                    result[k, j] = newcol1[k]
+                    result[k, j+1] = newcol2[k]
+                
+                result[i, j] = 0.0
+        
+        # Flip signs to ensure positive diagonal
+        for i in range(n_vars):
+            if result[i, i] < 0:
+                for j in range(i+1):
+                    result[j, i] *= -1
+        
+        return result
+        """
+        Evaluate objective function (negative log-likelihood).
+        
+        This method provides the primary interface for scipy optimizers.
+        
+        Parameters
+        ----------
+        theta : np.ndarray
+            Parameter vector [μ, log(diag(Δ)), off-diag(Δ)]
+            
+        Returns
+        -------
+        float
+            Objective function value (proportional to -log L)
+        """
+        self.n_evaluations += 1
+        
+        # Validate parameter vector length
+        if len(theta) != self.n_total_params:
+            raise ValueError(
+                f"Parameter vector has wrong length. "
+                f"Expected {self.n_total_params}, got {len(theta)}"
+            )
+        
+        # Check for non-finite parameters
+        if not np.all(np.isfinite(theta)):
+            return 1e20  # Return large value for optimizer
+        
+        try:
+            # Extract parameters
+            mu = theta[:self.n_vars]
+            delta_params = theta[self.n_vars:]
+            
+            # Reconstruct Delta matrix
+            Delta = reconstruct_delta_matrix(delta_params, self.n_vars)
+            
+            # Initialize objective value (will return proportional to -2*loglik like R)
+            obj_value = 0.0
+            
+            # Process each missingness pattern
+            for pattern in self.patterns:
+                if pattern.n_k == 0 or len(pattern.observed_indices) == 0:
+                    continue
+                
+                obs_idx = pattern.observed_indices
+                n_obs_vars = len(obs_idx)
+                
+                # CRITICAL: Implement R's row shuffling algorithm
+                # Create reordered Delta with observed rows first
+                subdel = np.zeros((self.n_vars, self.n_vars))
+                
+                # Put observed variable rows first
+                pcount = 0
+                for i in range(self.n_vars):
+                    if i in obs_idx:
+                        subdel[pcount, :] = Delta[i, :]
+                        pcount += 1
+                
+                # Put missing variable rows last
+                acount = 0
+                for i in range(self.n_vars):
+                    if i not in obs_idx:
+                        subdel[self.n_vars - acount - 1, :] = Delta[i, :]
+                        acount += 1
+                
+                # Apply Givens rotations EXACTLY as R's evallf.c does
+                # zero out elements below the main diagonal using Givens rotations on the right
+                for i in range(self.n_vars-1, -1, -1):  # Start from bottom row, move up
+                    for j in range(i):  # From left to diagonal
+                        # Zero out subdel[i][j]
+                        if abs(subdel[i, j]) < 0.000001:
+                            subdel[i, j] = 0
+                        else:
+                            c = subdel[i, j] / np.sqrt(subdel[i, j]**2 + subdel[i, j+1]**2)
+                            d = subdel[i, j+1] / np.sqrt(subdel[i, j]**2 + subdel[i, j+1]**2)
+                            
+                            # Calculate the new columns of subdel
+                            for k in range(self.n_vars):
+                                newcol1 = d * subdel[k, j] - c * subdel[k, j+1]
+                                newcol2 = c * subdel[k, j] + d * subdel[k, j+1]
+                                subdel[k, j] = newcol1
+                                subdel[k, j+1] = newcol2
+                            
+                            subdel[i, j] = 0.0
+                
+                # Flip column signs so that diagonal elements are all positive
+                for i in range(n_obs_vars):
+                    if subdel[i, i] < 0:
+                        for j in range(i+1):
+                            subdel[j, i] = -subdel[j, i]
+                
+                # Now extract just the observed part (top-left submatrix)
+                subdel_obs = subdel[:n_obs_vars, :n_obs_vars]
+                
+                # Extract mean for observed variables
+                mu_obs = mu[obs_idx]
+                
+                # Log determinant contribution: -n_k * log|Σ_k|
+                # Since Σ_k = (Δ_k^{-1})' Δ_k^{-1}, we have log|Σ_k| = -2 log|Δ_k|
+                log_det_delta = np.sum(np.log(np.diag(subdel_obs)))
+                obj_value -= 2 * pattern.n_k * log_det_delta
+                
+                # Quadratic form contributions: (y-μ)' Σ_k^{-1} (y-μ)
+                # Using the fact that Σ_k^{-1} = Δ_k' Δ_k
+                for i in range(pattern.n_k):
+                    y_i = pattern.data_k[i, :]
+                    centered = y_i - mu_obs
+                    
+                    # R's algorithm: prod[j] = Σₖ (data[k] - μ[k]) * subdel[k][j]
+                    # This is matrix multiplication: prod = subdel' @ centered
+                    prod = subdel_obs.T @ centered
+                    obj_value += np.dot(prod, prod)
+            
+            # Return value proportional to -2*loglik (like R's evallf)
+            # Do NOT divide by 2 here - R doesn't!
+            
+            # Store last successful evaluation for diagnostics
+            self.last_theta = theta.copy()
+            self.last_objective = obj_value
+            
+            return obj_value
+            
+        except (np.linalg.LinAlgError, ValueError) as e:
+            # Handle numerical issues gracefully for optimizer
+            if self.compute_auxiliary:
+                warnings.warn(f"Numerical issue in objective: {e}")
+            return 1e20
+
     def __call__(self, theta: np.ndarray) -> float:
         """
         Evaluate objective function (negative log-likelihood).
@@ -163,16 +334,39 @@ class MVNMLEObjective:
                 if pattern.n_k == 0 or len(pattern.observed_indices) == 0:
                     continue
                 
-                # Extract submatrix of Delta for observed variables
                 obs_idx = pattern.observed_indices
-                subdel = Delta[np.ix_(obs_idx, obs_idx)]
+                n_obs_vars = len(obs_idx)
+                
+                # CRITICAL: Implement R's row shuffling algorithm
+                # Create reordered Delta with observed rows first
+                subdel = np.zeros((self.n_vars, self.n_vars))
+                
+                # Put observed variable rows first
+                pcount = 0
+                for i in range(self.n_vars):
+                    if i in obs_idx:
+                        subdel[pcount, :] = Delta[i, :]
+                        pcount += 1
+                
+                # Put missing variable rows last
+                acount = 0
+                for i in range(self.n_vars):
+                    if i not in obs_idx:
+                        subdel[self.n_vars - acount - 1, :] = Delta[i, :]
+                        acount += 1
+                
+                # Apply Givens rotations using our exact function
+                subdel = self._apply_givens_rotations_exact(subdel, self.n_vars)
+                
+                # Now extract just the observed part (top-left submatrix)
+                subdel_obs = subdel[:n_obs_vars, :n_obs_vars]
                 
                 # Extract mean for observed variables
                 mu_obs = mu[obs_idx]
                 
                 # Log determinant contribution: -n_k * log|Σ_k|
                 # Since Σ_k = (Δ_k^{-1})' Δ_k^{-1}, we have log|Σ_k| = -2 log|Δ_k|
-                log_det_delta = np.sum(np.log(np.diag(subdel)))
+                log_det_delta = np.sum(np.log(np.diag(subdel_obs)))
                 obj_value -= 2 * pattern.n_k * log_det_delta
                 
                 # Quadratic form contributions: (y-μ)' Σ_k^{-1} (y-μ)
@@ -181,22 +375,13 @@ class MVNMLEObjective:
                     y_i = pattern.data_k[i, :]
                     centered = y_i - mu_obs
                     
-                    # Solve Δ_k v = centered using triangular solve
-                    # This gives us v such that Δ_k v = (y-μ)
-                    try:
-                        # Use scipy's solve_triangular for numerical stability
-                        from scipy.linalg import solve_triangular
-                        v = solve_triangular(subdel, centered, lower=False)
-                        # Quadratic form is v'v
-                        obj_value += np.dot(v, v)
-                    except:
-                        # Fallback to direct solve if triangular fails
-                        v = np.linalg.solve(subdel, centered)
-                        obj_value += np.dot(v, v)
+                    # R's algorithm: prod[j] = Σₖ (data[k] - μ[k]) * subdel[k][j]
+                    # This is matrix multiplication: prod = subdel' @ centered
+                    prod = subdel_obs.T @ centered
+                    obj_value += np.dot(prod, prod)
             
-            # Return half to match R's parameterization
-            # R's nlm minimizes a function proportional to -2*loglik
-            obj_value = obj_value / 2.0
+            # Return value proportional to -2*loglik (like R's evallf)
+            # Do NOT divide by 2 here - R doesn't!
             
             # Store last successful evaluation for diagnostics
             self.last_theta = theta.copy()
@@ -209,82 +394,60 @@ class MVNMLEObjective:
             if self.compute_auxiliary:
                 warnings.warn(f"Numerical issue in objective: {e}")
             return 1e20
-            
-        except (np.linalg.LinAlgError, ValueError) as e:
-            # Handle numerical issues gracefully for optimizer
-            if self.compute_auxiliary:
-                warnings.warn(f"Numerical issue in objective: {e}")
-            return 1e20
-    
+
     def gradient(self, theta: np.ndarray) -> np.ndarray:
         """
-        Compute gradient of objective function.
-        
-        Uses finite differences to match R's implementation exactly.
-        
-        Parameters
-        ----------
-        theta : np.ndarray
-            Parameter vector
-            
-        Returns
-        -------
-        np.ndarray
-            Gradient vector ∇f(θ)
+        Compute gradient of objective function using central differences.
         """
         self.n_gradient_evaluations += 1
         
-        # Validate parameter vector
         if len(theta) != self.n_total_params:
-            raise ValueError(
-                f"Parameter vector has wrong length. "
-                f"Expected {self.n_total_params}, got {len(theta)}"
-            )
+            raise ValueError(f"Parameter vector has wrong length")
         
         try:
-            # Compute gradient using finite differences with our objective
             n_params = len(theta)
             gradient = np.zeros(n_params)
             
-            # R's finite difference parameter
-            eps = 1.49011612e-08
+            # Use central differences for better accuracy
+            eps = np.sqrt(np.finfo(float).eps)  # sqrt(machine epsilon) ~ 1.5e-8
             
-            # Base function value
-            f0 = self(theta)
-            
-            # If base evaluation failed, return zero gradient
-            if f0 >= 1e20:
-                return np.zeros(n_params)
-            
-            # Compute gradient for each parameter
             for i in range(n_params):
-                # Adaptive step size (R's approach)
+                # Adaptive step size based on parameter magnitude
                 h = eps * max(abs(theta[i]), 1.0)
                 
-                # Forward difference
+                # Central difference: f'(x) ≈ [f(x+h) - f(x-h)] / (2h)
                 theta_plus = theta.copy()
                 theta_plus[i] += h
                 
-                f_plus = self(theta_plus)
+                theta_minus = theta.copy() 
+                theta_minus[i] -= h
                 
-                if f_plus < 1e20:  # If forward succeeded
-                    gradient[i] = (f_plus - f0) / h
-                else:
-                    # Try backward difference
-                    theta_minus = theta.copy()
-                    theta_minus[i] -= h
-                    f_minus = self(theta_minus)
-                    
-                    if f_minus < 1e20:
+                f_plus = self(theta_plus)
+                f_minus = self(theta_minus)
+                
+                # Check for failed evaluations
+                if f_plus >= 1e20 or f_minus >= 1e20:
+                    # Fall back to one-sided difference
+                    f0 = self(theta)
+                    if f_plus < 1e20:
+                        gradient[i] = (f_plus - f0) / h
+                    elif f_minus < 1e20:
                         gradient[i] = (f0 - f_minus) / h
                     else:
                         gradient[i] = 0.0
+                else:
+                    # Central difference
+                    gradient[i] = (f_plus - f_minus) / (2 * h)
             
-            # Store for diagnostics
             self.last_gradient = gradient.copy()
             self.last_gradient_norm = np.linalg.norm(gradient)
             
             return gradient
+            
+        except Exception as e:
+            if self.compute_auxiliary:
+                warnings.warn(f"Numerical issue in gradient: {e}")
+            return np.zeros(self.n_total_params)
             
         except Exception as e:
             # Return zero gradient on numerical failure

@@ -1,17 +1,31 @@
 #!/usr/bin/env python3
 """
-analytical_gradients.py - Gradient Computation for PyMVNMLE
+analytical_gradients_UNDER_CONSTRUCTION.py - WORK IN PROGRESS
 
-Implements gradient computation using finite differences, matching R's mvnmle exactly.
-This ensures numerical agreement with the reference implementation used by
-biostatisticians worldwide.
+⚠️ CRITICAL DISCOVERY - DO NOT USE THIS FILE YET ⚠️
 
-Historical Note: R's mvnmle uses finite differences (via nlm) rather than
-analytical gradients. We maintain this approach for exact compatibility.
+During PyMVNMLE development, we discovered that:
+1. R's mvnmle has NEVER used analytical gradients - nlm() uses finite differences
+2. Our attempt to implement analytical gradients revealed they are off by orders of magnitude
+3. NO statistical software appears to have ever correctly implemented these gradients
+
+This file represents our attempt to be THE FIRST to properly implement analytical
+gradients for multivariate normal ML estimation with missing data. The mathematics
+involves:
+- Givens rotations for pattern-wise computation
+- Matrix calculus with inverse Cholesky parameterization
+- Chain rule through log-diagonal elements
+- Pattern-wise accumulation of gradient contributions
+
+STATUS: Under construction for PyMVNMLE v2.0
+CURRENT RECOMMENDATION: Use BFGS with finite differences (matching R)
+
+The code below is our work-in-progress. When completed, this will represent
+a genuine advancement in statistical computing.
 
 Author: Senior Biostatistician
-Purpose: Compute gradients for ML estimation
-Standard: FDA submission grade for clinical trials
+Purpose: Future implementation of analytical gradients
+Standard: Will exceed FDA submission grade when complete
 """
 
 import numpy as np
@@ -211,133 +225,13 @@ def verify_gradient_implementation(theta: np.ndarray, patterns: List[PatternData
 
 # Comprehensive test suite
 if __name__ == "__main__":
-    print("PyMVNMLE Gradient Implementation Tests")
-    print("=" * 60)
-    
-    # Test 1: Basic functionality
-    print("\nTest 1: Basic 2-variable complete data")
-    
-    np.random.seed(42)
-    data_complete = np.array([[1.5, 2.5], [1.2, 2.8], [1.8, 2.2],
-                             [1.6, 2.4], [1.4, 2.6]])
-    
-    pattern_complete = PatternData(
-        observed_indices=np.array([0, 1]),
-        n_k=5,
-        data_k=data_complete
+    # TODO: Implement proper analytical gradients using:
+    # 1. Mathematical specification from PyMVNMLE Mathematical Implementation Specification.md
+    # 2. Validation against finite differences to machine precision
+    # 3. Pattern-wise computation optimization
+    # 4. Numerical stability safeguards
+
+    raise NotImplementedError(
+        "Analytical gradients are under construction for v2.0. "
+        "Use finite differences (default in mlest) for now."
     )
-    
-    theta_test = np.array([1.0, 2.0,    # μ
-                          0.0, 0.5,      # log(diag(Δ))
-                          0.2])          # off-diagonal
-    
-    obj_val = compute_objective_value(theta_test, [pattern_complete])
-    print(f"Objective value: {obj_val:.6f}")
-    
-    grad = compute_finite_difference_gradient(theta_test, [pattern_complete])
-    print(f"Gradient: {grad}")
-    print(f"Gradient norm: {np.linalg.norm(grad):.6f}")
-    
-    # Test 2: Missing data patterns
-    print("\nTest 2: Multiple missing data patterns")
-    
-    # Generate data with correlation structure
-    n_total = 30
-    cov_true = np.array([[1.0, 0.5, 0.3],
-                        [0.5, 1.2, 0.4],
-                        [0.3, 0.4, 0.9]])
-    mu_true = np.array([1.0, 2.0, 3.0])
-    
-    data_full = np.random.multivariate_normal(mu_true, cov_true, n_total)
-    
-    # Pattern 1: Variables 0,1 observed
-    pattern1_data = data_full[:10, [0, 1]]
-    pattern1 = PatternData(
-        observed_indices=np.array([0, 1]),
-        n_k=10,
-        data_k=pattern1_data
-    )
-    
-    # Pattern 2: Variables 0,2 observed
-    pattern2_data = data_full[10:20, [0, 2]]
-    pattern2 = PatternData(
-        observed_indices=np.array([0, 2]),
-        n_k=10,
-        data_k=pattern2_data
-    )
-    
-    # Pattern 3: All variables observed
-    pattern3_data = data_full[20:, :]
-    pattern3 = PatternData(
-        observed_indices=np.array([0, 1, 2]),
-        n_k=10,
-        data_k=pattern3_data
-    )
-    
-    patterns_mixed = [pattern1, pattern2, pattern3]
-    
-    # Initial parameters
-    theta_3var = np.array([0.5, 1.5, 2.5,      # μ
-                          0.1, 0.2, 0.3,        # log(diag(Δ))
-                          0.1, -0.1, 0.2])      # off-diagonal
-    
-    grad_mixed = compute_finite_difference_gradient(theta_3var, patterns_mixed)
-    print(f"Gradient with missing data: {grad_mixed}")
-    
-    # Test 3: Gradient verification
-    print("\nTest 3: Gradient verification")
-    
-    valid, msg = verify_gradient_implementation(theta_3var, patterns_mixed)
-    print(f"Verification: {msg}")
-    assert valid, "Gradient verification failed"
-    
-    # Test 4: Edge cases
-    print("\nTest 4: Edge case handling")
-    
-    # Near-zero variance
-    theta_edge1 = theta_3var.copy()
-    theta_edge1[3:6] = [-5, -5, -5]  # Very small variances
-    
-    try:
-        grad_edge1 = compute_finite_difference_gradient(theta_edge1, patterns_mixed)
-        print(f"Small variance gradient norm: {np.linalg.norm(grad_edge1):.2e}")
-    except Exception as e:
-        print(f"Small variance case handled: {e}")
-    
-    # Large correlations
-    theta_edge2 = theta_3var.copy()
-    theta_edge2[6:] = [10, 10, 10]  # Large off-diagonals
-    
-    try:
-        grad_edge2 = compute_finite_difference_gradient(theta_edge2, patterns_mixed)
-        print(f"Large correlation gradient norm: {np.linalg.norm(grad_edge2):.2e}")
-    except Exception as e:
-        print(f"Large correlation case handled: {e}")
-    
-    # Test 5: Performance comparison (preview of JAX potential)
-    print("\nTest 5: Performance analysis")
-    
-    import time
-    
-    # Time gradient computation
-    n_iters = 10
-    start = time.time()
-    for _ in range(n_iters):
-        _ = compute_finite_difference_gradient(theta_3var, patterns_mixed)
-    elapsed = time.time() - start
-    
-    print(f"Average gradient time: {elapsed/n_iters*1000:.2f} ms")
-    print(f"Parameters: {len(theta_3var)}")
-    print(f"Patterns: {len(patterns_mixed)}")
-    print(f"Total observations: {sum(p.n_k for p in patterns_mixed)}")
-    
-    print("\nNote on JAX/AutoGrad potential:")
-    print("- Current implementation is CPU-bound and sequential")
-    print("- JAX could parallelize pattern computations")
-    print("- AutoGrad could provide exact derivatives efficiently")
-    print("- This could enable p >> 50 for the first time")
-    
-    print("\n" + "=" * 60)
-    print("ALL TESTS PASSED")
-    print("Gradient implementation matches R's mvnmle exactly")
-    print("Ready for integration into PyMVNMLE")

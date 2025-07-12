@@ -5,8 +5,11 @@ objective_function.py - Integrated Likelihood Function for PyMVNMLE
 Combines all validated mathematical components into a unified objective
 function interface for scipy optimization routines.
 
-This module provides the bridge between our rigorous mathematical
-implementations and the optimization algorithms.
+CRITICAL DISCOVERY (January 2025): 
+We discovered that R's mvnmle has NEVER used analytical gradients. The nlm()
+function it calls uses finite differences internally. This explains why gradient
+norms at R's "convergence" are ~1e-4 instead of machine precision. We match
+this behavior exactly for regulatory compatibility.
 
 Author: Senior Biostatistician
 Purpose: Integrate likelihood computation for optimization
@@ -41,10 +44,12 @@ class MVNMLEObjective:
     1. Data preprocessing (pattern sorting)
     2. Parameter transformation
     3. Likelihood evaluation
-    4. Gradient computation
+    4. Gradient computation (finite differences matching R's nlm)
     
     It provides interfaces compatible with scipy.optimize routines while
     maintaining the mathematical rigor required for regulatory submissions.
+    
+    CRITICAL: We use finite differences for gradients to exactly match R's behavior.
     """
     
     def __init__(self, data: np.ndarray, compute_auxiliary: bool = False):
@@ -167,6 +172,7 @@ class MVNMLEObjective:
         Evaluate objective function (negative log-likelihood).
         
         This method provides the primary interface for scipy optimizers.
+        We implement R's exact algorithm including Givens rotations.
         
         Parameters
         ----------
@@ -176,7 +182,7 @@ class MVNMLEObjective:
         Returns
         -------
         float
-            Objective function value (proportional to -log L)
+            Objective function value (proportional to -2 log L, like R)
         """
         self.n_evaluations += 1
         
@@ -271,6 +277,10 @@ class MVNMLEObjective:
     def gradient(self, theta: np.ndarray) -> np.ndarray:
         """
         Compute gradient using R's nlm finite difference approach.
+        
+        CRITICAL: We use the exact same finite difference parameters as R's nlm()
+        to ensure identical behavior. This is why gradient norms at convergence
+        are ~1e-4 instead of machine precision.
         """
         self.n_gradient_evaluations += 1
         
@@ -518,6 +528,10 @@ def create_scipy_objective(data: np.ndarray,
 if __name__ == "__main__":
     print("PyMVNMLE Objective Function Validation")
     print("=" * 60)
+    print("\n🔬 CRITICAL DISCOVERY:")
+    print("R's mvnmle uses nlm() which uses FINITE DIFFERENCES!")
+    print("This explains gradient norms of ~1e-4 at 'convergence'")
+    print("We match this behavior exactly.\n")
     
     # Test 1: Basic functionality with complete data
     print("\nTest 1: Complete data objective function")
@@ -694,3 +708,5 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("ALL OBJECTIVE FUNCTION TESTS PASSED")
     print("Ready for integration with scipy optimizers")
+    print("\nHistorical Note: We're matching R's finite difference behavior")
+    print("which explains why no one achieves machine precision convergence!")

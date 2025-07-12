@@ -106,15 +106,6 @@ print(f"Log-likelihood: {result.loglik}")      # ℓ(μ̂,Σ̂)
 print(f"GPU accelerated: {result.gpu_accelerated}")
 ```
 
-### **Performance Revolution**
-| Problem Size | Laptop CPU | PyMVNMLE (GPU) | Speedup |
-|--------------|------------|----------------|---------|
-| n=1,000, p=20 | 5.2s | 0.8s | **6.5x** |
-| n=5,000, p=50 | 45.1s | 3.2s | **14.1x** |
-| n=10,000, p=100 | 8.3min | 12.4s | **40.2x** |
-
-*Benchmarks: M2 MacBook Pro vs Metal GPU acceleration*
-
 ---
 
 ## 📦 **Installation**
@@ -386,14 +377,25 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for:
 
 ---
 
-## 📊 **Backend Support Matrix**
+## 📊 **Performance Characteristics**
 
-| Backend | Hardware | Status | Installation | Performance |
-|---------|----------|--------|--------------|-------------|
-| **NumPy** | CPU | ✅ Production | Built-in | Baseline |
-| **CuPy** | NVIDIA GPU | ✅ Production | `pip install cupy` | 5-50x speedup |
-| **Metal** | Apple Silicon | ✅ Production | `pip install torch` | 3-15x speedup |
-| **JAX** | CPU/GPU/TPU | ✅ Tested | `pip install jax` | 2-100x speedup |
+### **Validated Performance (Empirical Testing)**
+- **Small datasets** (n<100, p<10): ~0.02s across all backends
+- **Medium datasets** (n~200, p~10): ~80s across all backends  
+- **Large datasets**: Computational complexity limits scalability
+
+### **Backend Equivalence**
+All backends produce **identical numerical results** with minimal performance differences:
+- **NumPy (CPU)**: Reliable baseline, production-ready
+- **GPU backends**: Numerically equivalent, future-ready architecture
+- **Auto-selection**: Intelligently defaults to CPU for stability
+
+### **v2.0 Performance Vision**
+- **Analytical gradients**: Potential 10-100x speedup (eliminates finite differences)
+- **Pattern parallelization**: True GPU acceleration of core algorithms
+- **Custom kernels**: Optimized implementations for massive datasets
+
+*Current version prioritizes mathematical correctness and regulatory compliance over raw speed.*
 
 ### **Hardware Requirements**
 - **CPU**: Any x86_64 or ARM64 processor

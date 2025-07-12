@@ -12,11 +12,10 @@ Standard: FDA submission grade
 """
 
 import numpy as np
-from typing import Tuple, Dict, Any, Optional, Callable, List
+import pandas as pd
+from typing import Tuple, Dict, Any, Optional, Callable, List, Union
 from dataclasses import dataclass
 import warnings
-
-from ._utils import mysort_data, get_starting_values, validate_input_data, reconstruct_delta_matrix
 
 
 @dataclass
@@ -55,12 +54,12 @@ class MVNMLEObjective:
             Whether to compute auxiliary information (for diagnostics)
         """
         # Validate and clean data using our validated function
-        self.data = validate_input_data(data)
+        self.data = self._validate_input_data(data)
         self.n_obs, self.n_vars = self.data.shape
         self.compute_auxiliary = compute_auxiliary
         
         # Preprocess data: sort by missingness patterns (R's mysort)
-        self.sorted_data, self.freq, self.presence_absence = mysort_data(self.data)
+        self.sorted_data, self.freq, self.presence_absence = self._mysort_data(self.data)
         
         # Convert to PatternData structures
         self.patterns = self._extract_pattern_data()
@@ -190,7 +189,7 @@ class MVNMLEObjective:
             delta_params = theta[self.n_vars:]
             
             # Reconstruct Delta matrix with bounds enforcement
-            Delta = reconstruct_delta_matrix(delta_params, self.n_vars)
+            Delta = self._reconstruct_delta_matrix(delta_params, self.n_vars)
             
             # Initialize objective value (proportional to -2*loglik like R)
             obj_value = 0.0
@@ -319,7 +318,7 @@ class MVNMLEObjective:
     def get_starting_values(self, method: str = 'moments') -> np.ndarray:
         """Get starting values using validated approach from scripts."""
         if method == 'moments':
-            return get_starting_values(self.data)
+            return self._get_starting_values(self.data)
         elif method == 'identity':
             # Alternative: identity covariance
             theta0 = np.zeros(self.n_total_params)
@@ -335,15 +334,249 @@ class MVNMLEObjective:
         
         Uses validated reconstruction from scripts/parameter_reconstruction.py
         """
-        from ._utils import reconstruct_covariance_matrix
-        
         mu = theta[:self.n_vars]
         delta_params = theta[self.n_vars:]
         
         # Reconstruct covariance using validated approach
-        sigmahat = reconstruct_covariance_matrix(delta_params, self.n_vars)
+        sigmahat = self._reconstruct_covariance_matrix(delta_params, self.n_vars)
         
         return mu, sigmahat
+    
+    def _mysort_data(self, data: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Sort data by missingness patterns (direct port of R's mysort).
+        
+        This is CRITICAL for computational efficiency and R compatibility.
+        """
+        n_obs, n_vars = data.shape
+        
+        # Create binary representation (1=observed, 0=missing)
+        is_observed = (~np.isnan(data)).astype(int)
+        
+        # Convert to decimal representation for sorting
+        powers = 2 ** np.arange(n_vars - 1, -1, -1)
+        pattern_codes = is_observed @ powers
+        
+        # Sort by pattern codes
+        sort_indices = np.argsort(pattern_codes)
+        sorted_data = data[sort_indices]
+        sorted_patterns = is_observed[sort_indices]
+        sorted_codes = pattern_codes[sort_indices]
+        
+        # Count frequency of each unique pattern
+        unique_codes, inverse_indices, freq = np.unique(
+            sorted_codes, return_inverse=True, return_counts=True
+        )
+        
+        # Extract unique patterns
+        presence_absence = []
+        current_code = -1
+        for i, code in enumerate(sorted_codes):
+            if code != current_code:
+                presence_absence.append(sorted_patterns[i])
+                current_code = code
+        
+        presence_absence = np.array(presence_absence)
+        
+        return sorted_data, freq, presence_absence
+    
+    def _reconstruct_delta_matrix(self, theta_delta_params: np.ndarray, n_vars: int) -> np.ndarray:
+        """
+        Reconstruct Δ (Delta) matrix from parameter vector.
+        
+        EXACT port from scripts/parameter_reconstruction.py with parameter bounds.
+        """
+        # Input validation
+        expected_length = n_vars + n_vars * (n_vars - 1) // 2
+        if len(theta_delta_params) != expected_length:
+            raise ValueError(
+                f"theta_delta_params wrong length: {len(theta_delta_params)} vs {expected_length}"
+            )
+        
+        # Initialize Delta matrix
+        Delta = np.zeros((n_vars, n_vars), dtype=np.float64)
+        
+        # Step 1: Set diagonal elements (exponentiated with bounds)
+        diagonal_params = theta_delta_params[:n_vars]
+        
+        # Apply bounds: -10 ≤ log(Δⱼⱼ) ≤ 10 (prevent overflow)
+        diagonal_params_clamped = np.clip(diagonal_params, -10.0, 10.0)
+        
+        for j in range(n_vars):
+            Delta[j, j] = np.exp(diagonal_params_clamped[j])
+        
+        # Step 2: Set upper triangular elements (R's exact ordering)
+        param_idx = n_vars
+        
+        for j in range(1, n_vars):  # Column (R's order)
+            for i in range(j):      # Row within column
+                if param_idx >= len(theta_delta_params):
+                    raise ValueError("Parameter index out of bounds")
+                
+                # Apply bounds: -100 ≤ Δᵢⱼ ≤ 100 for i ≠ j
+                Delta[i, j] = np.clip(theta_delta_params[param_idx], -100.0, 100.0)
+                param_idx += 1
+        
+        return Delta
+    
+    def _reconstruct_covariance_matrix(self, delta_params: np.ndarray, n_vars: int) -> np.ndarray:
+        """
+        Reconstruct covariance matrix Σ from Delta parameters.
+        """
+        # Reconstruct Delta
+        Delta = self._reconstruct_delta_matrix(delta_params, n_vars)
+        
+        # Compute X = Δ⁻¹ using triangular solve for stability
+        try:
+            import scipy.linalg as linalg
+            X = linalg.solve_triangular(Delta, np.eye(n_vars), lower=False)
+        except:
+            # Fallback to numpy if scipy not available
+            X = np.linalg.solve(Delta, np.eye(n_vars))
+        
+        # Compute Σ = XᵀX
+        Sigma = X.T @ X
+        
+        # Ensure exact symmetry
+        Sigma = 0.5 * (Sigma + Sigma.T)
+        
+        return Sigma
+    
+    def _get_starting_values(self, data: np.ndarray, eps: float = 1e-3) -> np.ndarray:
+        """
+        Compute starting values exactly like R's getstartvals() function.
+        """
+        n_obs, n_vars = data.shape
+        
+        # Starting values for mean: sample means
+        mu_start = np.nanmean(data, axis=0)
+        
+        # Sample covariance matrix (pairwise complete observations)
+        cov_sample = np.zeros((n_vars, n_vars))
+        
+        for i in range(n_vars):
+            for j in range(i, n_vars):
+                # Find pairwise complete observations
+                mask = ~(np.isnan(data[:, i]) | np.isnan(data[:, j]))
+                n_complete = np.sum(mask)
+                
+                if n_complete > 1:
+                    if i == j:
+                        # Variance
+                        cov_sample[i, i] = np.var(data[mask, i], ddof=1)
+                    else:
+                        # Covariance
+                        cov_ij = np.cov(data[mask, i], data[mask, j], ddof=1)[0, 1]
+                        cov_sample[i, j] = cov_ij
+                        cov_sample[j, i] = cov_ij
+                else:
+                    # No complete pairs, use defaults
+                    if i == j:
+                        cov_sample[i, i] = 1.0
+                    else:
+                        cov_sample[i, j] = 0.0
+                        cov_sample[j, i] = 0.0
+        
+        # Regularize to ensure positive definiteness (R's exact approach)
+        eigenvals, eigenvecs = np.linalg.eigh(cov_sample)
+        
+        # Find smallest positive eigenvalue
+        pos_eigenvals = eigenvals[eigenvals > 0]
+        if len(pos_eigenvals) > 0:
+            min_pos = np.min(pos_eigenvals)
+        else:
+            min_pos = 1.0
+        
+        # Regularize: any eigenvalue < eps * min_pos becomes eps * min_pos
+        threshold = eps * min_pos
+        regularized_eigenvals = np.maximum(eigenvals, threshold)
+        
+        # Reconstruct regularized covariance
+        cov_regularized = eigenvecs @ np.diag(regularized_eigenvals) @ eigenvecs.T
+        
+        # Get Cholesky factor (R uses upper triangular)
+        L = np.linalg.cholesky(cov_regularized)
+        chol_upper = L.T
+        
+        # Compute inverse Cholesky factor (Delta)
+        Delta_start = np.linalg.solve(chol_upper, np.eye(n_vars))
+        
+        # Ensure positive diagonal (R's sign adjustment)
+        for i in range(n_vars):
+            if Delta_start[i, i] < 0:
+                Delta_start[i, :] *= -1
+        
+        # Pack into parameter vector (R's exact ordering)
+        n_delta_params = n_vars + n_vars * (n_vars - 1) // 2
+        startvals = np.zeros(n_vars + n_delta_params)
+        
+        # Mean parameters
+        startvals[:n_vars] = mu_start
+        
+        # Log diagonal of Delta
+        startvals[n_vars:2*n_vars] = np.log(np.diag(Delta_start))
+        
+        # Off-diagonal elements of Delta (R's ordering: by column)
+        param_idx = 2 * n_vars
+        for j in range(1, n_vars):
+            for i in range(j):
+                startvals[param_idx] = Delta_start[i, j]
+                param_idx += 1
+        
+        return startvals
+    
+    def _validate_input_data(self, data: Union[np.ndarray, pd.DataFrame]) -> np.ndarray:
+        """
+        Validate and preprocess input data for ML estimation.
+        """
+        # Convert to NumPy array
+        if isinstance(data, pd.DataFrame):
+            data_array = data.values
+        else:
+            data_array = np.asarray(data)
+        
+        # Basic shape validation
+        if data_array.ndim != 2:
+            raise ValueError(f"Data must be 2-dimensional, got {data_array.ndim}D")
+        
+        n_obs, n_vars = data_array.shape
+        
+        if n_obs < 2:
+            raise ValueError(f"Need at least 2 observations, got {n_obs}")
+        
+        if n_vars < 1:
+            raise ValueError(f"Need at least 1 variable, got {n_vars}")
+        
+        # Data type validation
+        if not np.issubdtype(data_array.dtype, np.number):
+            raise ValueError("Data must be numeric")
+        
+        # Convert to float64 for numerical stability
+        data_array = data_array.astype(np.float64)
+        
+        # Check for completely missing observations
+        completely_missing = np.all(np.isnan(data_array), axis=1)
+        if np.any(completely_missing):
+            n_missing = np.sum(completely_missing)
+            warnings.warn(f"Removing {n_missing} completely missing observations")
+            data_array = data_array[~completely_missing]
+            n_obs = data_array.shape[0]
+            
+            if n_obs < 2:
+                raise ValueError("Too few observations after removing completely missing rows")
+        
+        # Check for completely missing variables
+        completely_missing_vars = np.all(np.isnan(data_array), axis=0)
+        if np.any(completely_missing_vars):
+            missing_var_indices = np.where(completely_missing_vars)[0]
+            raise ValueError(f"Variables {missing_var_indices} are completely missing")
+        
+        # Check for non-finite values (inf, -inf)
+        non_finite_mask = ~np.isfinite(data_array) & ~np.isnan(data_array)
+        if np.any(non_finite_mask):
+            raise ValueError("Data contains non-finite values (inf or -inf)")
+        
+        return data_array
     
     def diagnostics(self) -> Dict[str, Any]:
         """Get diagnostic information about optimization."""

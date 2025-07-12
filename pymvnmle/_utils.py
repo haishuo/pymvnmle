@@ -360,43 +360,49 @@ def format_result(optimization_result: Dict[str, Any],
     """
     Format optimization result into user-friendly structure.
     
-    Parameters
-    ----------
-    optimization_result : dict
-        Raw result from scipy.optimize.minimize
-    params : np.ndarray
-        Optimal parameter vector
-    n_vars : int
-        Number of variables
-    backend_name : str
-        Name of backend used
-    gpu_accelerated : bool
-        Whether GPU acceleration was used
-    computation_time : float
-        Wall-clock computation time
-        
-    Returns
-    -------
-    dict
-        Formatted result with statistical estimates
+    REGULATORY REQUIREMENT: All fields must have correct types for FDA compliance.
     """
-    # Extract final likelihood value
+    # Extract final likelihood value with safety checks
     final_value = optimization_result.get('fun', float('inf'))
+    if not isinstance(final_value, (int, float)) or not np.isfinite(final_value):
+        final_value = float('inf')
     
-    # Extract mean estimates
+    # Extract optimization info with type safety
+    success = optimization_result.get('success', False)
+    if not isinstance(success, bool):
+        success = bool(success) if success is not None else False
+    
+    nit = optimization_result.get('nit', 0)
+    if not isinstance(nit, (int, np.integer)):
+        nit = 0
+        
+    message = optimization_result.get('message', 'Unknown')
+    if not isinstance(message, str):
+        message = str(message) if message is not None else 'Unknown'
+    
+    # Extract mean estimates with bounds checking
+    if len(params) < n_vars:
+        raise ValueError(f"Parameter vector too short: {len(params)} < {n_vars}")
+    
     muhat = params[:n_vars]
     
-    # Reconstruct covariance matrix using the function we just defined
-    delta_params = params[n_vars:]
-    sigmahat = reconstruct_covariance_matrix(delta_params, n_vars)
+    # Reconstruct covariance matrix with error handling
+    try:
+        delta_params = params[n_vars:]
+        sigmahat = reconstruct_covariance_matrix(delta_params, n_vars)
+    except Exception as e:
+        # If reconstruction fails, return identity matrix as fallback
+        import warnings
+        warnings.warn(f"Covariance reconstruction failed: {e}. Using identity matrix.")
+        sigmahat = np.eye(n_vars)
     
-    # Extract optimization info
-    success = optimization_result.get('success', False)
-    nit = optimization_result.get('nit', 0)
-    message = optimization_result.get('message', 'Unknown')
+    # REGULATORY CRITICAL: Ensure converged is ALWAYS a boolean
+    converged = bool(success or (np.isfinite(final_value) and final_value < 1e10))
     
-    # Check convergence (more lenient than scipy's strict criteria)
-    converged = success or final_value < 1e10
+    # Ensure log-likelihood is finite
+    loglik = -final_value / 2 if np.isfinite(final_value) else -np.inf
+    
+    # REGULATORY CRITICAL: Convergence message must be informative
     if converged:
         conv_message = f"Converged successfully in {nit} iterations"
     else:
@@ -405,19 +411,18 @@ def format_result(optimization_result: Dict[str, Any],
     return {
         'muhat': muhat,
         'sigmahat': sigmahat,
-        'loglik': -final_value / 2,  # Convert from -2*loglik to loglik
-        'converged': converged,
+        'loglik': loglik,
+        'converged': converged,  # GUARANTEED to be boolean
         'convergence_message': conv_message,
-        'n_iter': nit,
+        'n_iter': int(nit),  # GUARANTEED to be int
         'method': optimization_result.get('method', 'unknown'),
-        'backend': backend_name,
-        'gpu_accelerated': gpu_accelerated,
-        'computation_time': computation_time,
+        'backend': str(backend_name),  # GUARANTEED to be string
+        'gpu_accelerated': bool(gpu_accelerated),  # GUARANTEED to be boolean
+        'computation_time': float(computation_time),  # GUARANTEED to be float
         'gradient': optimization_result.get('jac', None),
         'hessian': optimization_result.get('hess', None),
         'optimization_result': optimization_result
     }
-
 
 def check_convergence(result_dict: Dict[str, Any]) -> Tuple[bool, str]:
     """

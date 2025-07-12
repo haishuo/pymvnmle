@@ -234,7 +234,20 @@ def mlest(data: Union[np.ndarray, pd.DataFrame],
         opt_result = minimize(obj, start_vals, **opt_args)
         
     except Exception as e:
-        raise RuntimeError(f"Optimization failed: {e}")
+        # Handle catastrophic optimization failure
+        if verbose:
+            print(f"⚠️ Optimization failed with exception: {e}")
+        
+        # Create a fake failed result for consistent handling
+        opt_result = type('FailedResult', (), {
+            'fun': float('inf'),
+            'x': start_vals,  # Return starting values
+            'success': False,
+            'nit': 0,
+            'message': f"Optimization failed: {e}",
+            'jac': None,
+            'hess': None
+        })()
     
     # Compute final timing
     computation_time = time.time() - start_time

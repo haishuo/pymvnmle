@@ -105,6 +105,13 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
+# CUDA installers and large binaries
+*.run
+cuda_*.run
+*.deb
+*.rpm
+*.tar.xz
+
 # ML/Data Science specific
 *.pkl
 *.pth

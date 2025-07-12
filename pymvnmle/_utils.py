@@ -158,6 +158,199 @@ def validate_input_data(data: Union[np.ndarray, pd.DataFrame]) -> np.ndarray:
     return data_array
 
 
+def reconstruct_delta_matrix(theta_delta_params: np.ndarray, n_vars: int) -> np.ndarray:
+    """
+    Reconstruct Δ (Delta) matrix from parameter vector.
+    
+    EXACT port from scripts/parameter_reconstruction.py with parameter bounds.
+    
+    Parameters
+    ----------
+    theta_delta_params : np.ndarray
+        Parameter vector containing:
+        - First n_vars elements: log(Δ₁₁), log(Δ₂₂), ..., log(Δₚₚ)
+        - Remaining elements: Δ₁₂, Δ₁₃, Δ₂₃, Δ₁₄, ..., Δₚ₋₁,ₚ
+        Total length: n_vars + n_vars*(n_vars-1)/2
+        
+    n_vars : int
+        Number of variables (p), must be positive
+        
+    Returns
+    -------
+    np.ndarray
+        Upper triangular matrix Δ of shape (n_vars, n_vars)
+        with positive diagonal elements
+    """
+    # Input validation
+    expected_length = n_vars + n_vars * (n_vars - 1) // 2
+    if len(theta_delta_params) != expected_length:
+        raise ValueError(
+            f"theta_delta_params wrong length: {len(theta_delta_params)} vs {expected_length}"
+        )
+    
+    # Initialize Delta matrix
+    Delta = np.zeros((n_vars, n_vars), dtype=np.float64)
+    
+    # Step 1: Set diagonal elements (exponentiated with bounds)
+    diagonal_params = theta_delta_params[:n_vars]
+    
+    # Apply bounds: -10 ≤ log(Δⱼⱼ) ≤ 10 (prevent overflow)
+    diagonal_params_clamped = np.clip(diagonal_params, -10.0, 10.0)
+    
+    for j in range(n_vars):
+        Delta[j, j] = np.exp(diagonal_params_clamped[j])
+    
+    # Step 2: Set upper triangular elements (R's exact ordering)
+    param_idx = n_vars
+    
+    for j in range(1, n_vars):  # Column (R's order)
+        for i in range(j):      # Row within column
+            if param_idx >= len(theta_delta_params):
+                raise ValueError("Parameter index out of bounds")
+            
+            # Apply bounds: -100 ≤ Δᵢⱼ ≤ 100 for i ≠ j
+            Delta[i, j] = np.clip(theta_delta_params[param_idx], -100.0, 100.0)
+            param_idx += 1
+    
+    return Delta
+
+
+def reconstruct_covariance_matrix(delta_params: np.ndarray, n_vars: int) -> np.ndarray:
+    """
+    Reconstruct covariance matrix Σ from Delta parameters.
+    
+    Uses the parameterization Σ = (Δ⁻¹)ᵀ(Δ⁻¹) = XᵀX where X = Δ⁻¹.
+    
+    Parameters
+    ----------
+    delta_params : np.ndarray
+        Delta matrix parameters
+    n_vars : int
+        Number of variables
+        
+    Returns
+    -------
+    np.ndarray
+        Reconstructed covariance matrix (symmetric positive definite)
+    """
+    # Reconstruct Delta matrix
+    Delta = reconstruct_delta_matrix(delta_params, n_vars)
+    
+    # Compute X = Δ⁻¹ using triangular solve for numerical stability
+    try:
+        import scipy.linalg as linalg
+        X = linalg.solve_triangular(Delta, np.eye(n_vars), lower=False)
+    except ImportError:
+        # Fallback to numpy if scipy not available
+        X = np.linalg.solve(Delta, np.eye(n_vars))
+    
+    # Compute Σ = XᵀX
+    Sigma = X.T @ X
+    
+    # Ensure exact symmetry for numerical stability
+    Sigma = 0.5 * (Sigma + Sigma.T)
+    
+    return Sigma
+
+
+def get_starting_values(data: np.ndarray, eps: float = 1e-3) -> np.ndarray:
+    """
+    Compute starting values exactly like R's getstartvals() function.
+    
+    EXACT port from scripts/pattern_preprocessing.py
+    
+    Parameters
+    ----------
+    data : np.ndarray
+        Input data with possible missing values
+    eps : float
+        Regularization parameter for eigenvalues
+        
+    Returns
+    -------
+    np.ndarray
+        Starting parameter vector [μ, log(diag(Δ)), off-diag(Δ)]
+    """
+    n_obs, n_vars = data.shape
+    
+    # Starting values for mean: sample means
+    mu_start = np.nanmean(data, axis=0)
+    
+    # Sample covariance matrix (pairwise complete observations)
+    cov_sample = np.zeros((n_vars, n_vars))
+    
+    for i in range(n_vars):
+        for j in range(i, n_vars):
+            # Find pairwise complete observations
+            mask = ~(np.isnan(data[:, i]) | np.isnan(data[:, j]))
+            n_complete = np.sum(mask)
+            
+            if n_complete > 1:
+                if i == j:
+                    # Variance
+                    cov_sample[i, i] = np.var(data[mask, i], ddof=1)
+                else:
+                    # Covariance
+                    cov_ij = np.cov(data[mask, i], data[mask, j], ddof=1)[0, 1]
+                    cov_sample[i, j] = cov_ij
+                    cov_sample[j, i] = cov_ij
+            else:
+                # No complete pairs, use defaults
+                if i == j:
+                    cov_sample[i, i] = 1.0
+                else:
+                    cov_sample[i, j] = 0.0
+                    cov_sample[j, i] = 0.0
+    
+    # Regularize to ensure positive definiteness (R's exact approach)
+    eigenvals, eigenvecs = np.linalg.eigh(cov_sample)
+    
+    # Find smallest positive eigenvalue
+    pos_eigenvals = eigenvals[eigenvals > 0]
+    if len(pos_eigenvals) > 0:
+        min_pos = np.min(pos_eigenvals)
+    else:
+        min_pos = 1.0
+    
+    # Regularize: any eigenvalue < eps * min_pos becomes eps * min_pos
+    threshold = eps * min_pos
+    regularized_eigenvals = np.maximum(eigenvals, threshold)
+    
+    # Reconstruct regularized covariance
+    cov_regularized = eigenvecs @ np.diag(regularized_eigenvals) @ eigenvecs.T
+    
+    # Get Cholesky factor (R uses upper triangular)
+    L = np.linalg.cholesky(cov_regularized)
+    chol_upper = L.T
+    
+    # Compute inverse Cholesky factor (Delta)
+    Delta_start = np.linalg.solve(chol_upper, np.eye(n_vars))
+    
+    # Ensure positive diagonal (R's sign adjustment)
+    for i in range(n_vars):
+        if Delta_start[i, i] < 0:
+            Delta_start[i, :] *= -1
+    
+    # Pack into parameter vector (R's exact ordering)
+    n_delta_params = n_vars + n_vars * (n_vars - 1) // 2
+    startvals = np.zeros(n_vars + n_delta_params)
+    
+    # Mean parameters
+    startvals[:n_vars] = mu_start
+    
+    # Log diagonal of Delta
+    startvals[n_vars:2*n_vars] = np.log(np.diag(Delta_start))
+    
+    # Off-diagonal elements of Delta (R's ordering: by column)
+    param_idx = 2 * n_vars
+    for j in range(1, n_vars):
+        for i in range(j):
+            startvals[param_idx] = Delta_start[i, j]
+            param_idx += 1
+    
+    return startvals
+
+
 def format_result(optimization_result: Dict[str, Any], 
                  params: np.ndarray,
                  n_vars: int,
@@ -193,7 +386,7 @@ def format_result(optimization_result: Dict[str, Any],
     # Extract mean estimates
     muhat = params[:n_vars]
     
-    # Reconstruct covariance matrix
+    # Reconstruct covariance matrix using the function we just defined
     delta_params = params[n_vars:]
     sigmahat = reconstruct_covariance_matrix(delta_params, n_vars)
     

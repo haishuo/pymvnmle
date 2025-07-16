@@ -1,372 +1,172 @@
 """
-NumPy backend for PyMVNMLE
-CPU-based reference implementation using NumPy and SciPy
+NumPy backend for PyMVNMLE v2.0
+CPU-based implementation using NumPy and SciPy - core functionality only
+
+DESIGN PRINCIPLE: Minimal, focused implementation
+- Core mathematical operations only
+- No system diagnostics bloat
+- No benchmarking utilities  
+- No complex device information
+- Just reliable linear algebra and finite differences
+
+This serves as the reference implementation for regulatory compliance.
 """
 
 import numpy as np
 import scipy.linalg as linalg
-from typing import Tuple, Union
-from .base import BackendInterface
+from typing import Tuple, Callable
+from .base import BackendInterface, NumericalError, GradientComputationError
 
 
 class NumPyBackend(BackendInterface):
     """
-    CPU backend using NumPy and SciPy.
+    CPU backend using NumPy and SciPy - lean and focused.
     
-    This serves as the reference implementation that all other backends
-    must match numerically. Uses mature, well-tested NumPy/SciPy routines
-    for maximum reliability and compatibility.
+    Responsibilities:
+    1. Core linear algebra operations (cholesky, solve, slogdet)
+    2. Finite difference gradient computation (R-compatible)
+    3. Reliable availability (always works)
+    4. Nothing else
     
-    Features:
-    - Always available (no optional dependencies)
-    - Numerically stable algorithms from LAPACK
-    - Comprehensive error handling
-    - Optimized for Intel MKL when available
-    - Serves as fallback for all other backends
+    This backend maintains exact R compatibility through finite differences
+    and serves as the gold standard that GPU backends must match numerically.
     """
     
     def __init__(self):
-        """Initialize NumPy backend."""
-        super().__init__()
-        self.name = "numpy"
-        self.available = True  # NumPy is always available
-        
-        # Get device and version information
-        self.device_info = {
-            'device_type': 'cpu',
-            'device_count': 1,
-            'backend_version': np.__version__,
-            'scipy_version': getattr(linalg, '__version__', 'unknown'),
-            'blas_info': self._get_blas_info(),
-            'processor_count': self._get_processor_count()
-        }
+        """Initialize NumPy backend - simple and reliable."""
+        # No complex initialization - NumPy is always available
+        pass
     
     @property
     def is_available(self) -> bool:
         """NumPy backend is always available."""
         return True
     
+    @property
+    def name(self) -> str:
+        """Backend name."""
+        return "numpy"
+    
+    def gradient_method(self) -> str:
+        """NumPy backend uses finite differences for R compatibility."""
+        return 'finite_differences'
+    
     def cholesky(self, matrix: np.ndarray, upper: bool = True) -> np.ndarray:
         """
         Compute Cholesky decomposition using scipy.linalg.cholesky.
         
-        Parameters
-        ----------
-        matrix : np.ndarray
-            Positive definite matrix to decompose
-        upper : bool, default=True
-            If True, return upper triangular factor
-            If False, return lower triangular factor
-            
-        Returns
-        -------
-        np.ndarray
-            Cholesky factor
-            
-        Notes
-        -----
-        Uses scipy.linalg.cholesky which provides better error handling
-        than np.linalg.cholesky and supports both upper/lower triangular output.
+        Uses scipy's implementation for better error handling than np.linalg.cholesky.
+        Critical for inverse Cholesky parameterization in missing data MLE.
         """
         try:
             # scipy.linalg.cholesky with lower=False gives upper triangular
             return linalg.cholesky(matrix, lower=not upper)
         except linalg.LinAlgError as e:
             if "not positive definite" in str(e).lower():
-                from .base import NumericalError
                 raise NumericalError(f"Matrix is not positive definite: {e}")
             else:
-                raise
+                raise NumericalError(f"Cholesky decomposition failed: {e}")
     
     def solve_triangular(self, a: np.ndarray, b: np.ndarray, 
-                        upper: bool = True, trans: str = 'N') -> np.ndarray:
+                        lower: bool = False) -> np.ndarray:
         """
         Solve triangular system using scipy.linalg.solve_triangular.
         
-        Parameters
-        ----------
-        a : np.ndarray
-            Triangular matrix (2D)
-        b : np.ndarray  
-            Right-hand side (1D or 2D)
-        upper : bool, default=True
-            Whether a is upper or lower triangular
-        trans : str, default='N'
-            'N': solve ax = b
-            'T': solve a.T x = b
-            'C': solve a.H x = b (conjugate transpose)
-            
-        Returns
-        -------
-        np.ndarray
-            Solution x
-            
-        Notes
-        -----
-        scipy.linalg.solve_triangular is optimized and numerically stable.
-        Automatically detects if matrix is singular.
+        Optimized for triangular systems - more stable than general linear solve.
+        Used extensively in likelihood computation for pattern-specific calculations.
         """
         try:
-            # Convert trans parameter to scipy format
-            trans_map = {'N': 0, 'T': 1, 'C': 2}
-            if trans not in trans_map:
-                raise ValueError(f"trans must be 'N', 'T', or 'C', got {trans}")
-            
-            return linalg.solve_triangular(
-                a, b, 
-                lower=not upper, 
-                trans=trans_map[trans],
-                check_finite=True
-            )
+            return linalg.solve_triangular(a, b, lower=lower)
         except linalg.LinAlgError as e:
-            from .base import NumericalError
-            raise NumericalError(f"Failed to solve triangular system: {e}")
+            raise NumericalError(f"Triangular solve failed: {e}")
     
     def slogdet(self, matrix: np.ndarray) -> Tuple[float, float]:
         """
         Compute sign and log-determinant using scipy.linalg.slogdet.
         
-        Parameters
-        ----------
-        matrix : np.ndarray
-            Square matrix
-            
-        Returns
-        -------
-        sign : float
-            Sign of the determinant (+1, -1, or 0)
-        logdet : float
-            Natural logarithm of absolute determinant
-            
-        Notes
-        -----
-        scipy.linalg.slogdet is numerically stable for computing log-determinants
-        and avoids overflow/underflow issues that plague direct determinant computation.
+        Numerically stable for computing log-determinants without overflow.
+        Essential for log-likelihood computation in missing data MLE.
         """
         try:
             sign, logdet = linalg.slogdet(matrix)
             return float(sign), float(logdet)
-        except linalg.LinAlgError as e:
-            from .base import NumericalError
-            raise NumericalError(f"Failed to compute log-determinant: {e}")
+        except Exception as e:
+            raise NumericalError(f"Log-determinant computation failed: {e}")
     
-    def inv(self, matrix: np.ndarray) -> np.ndarray:
+    def compute_gradient(self, objective_func: Callable, theta: np.ndarray, 
+                        step_size: float = 1e-8) -> np.ndarray:
         """
-        Compute matrix inverse using scipy.linalg.inv.
+        Compute gradient using finite differences - R-compatible method.
+        
+        This implements the exact finite difference scheme used by R's nlm() function,
+        producing gradient norms ~1e-4 at convergence (not machine precision).
         
         Parameters
         ----------
-        matrix : np.ndarray
-            Invertible square matrix
+        objective_func : callable
+            Function that takes parameter vector and returns scalar
+        theta : np.ndarray
+            Parameter vector at which to evaluate gradient  
+        step_size : float, default=1e-8
+            Step size for finite differences (matches R's nlm default)
             
         Returns
         -------
         np.ndarray
-            Matrix inverse
+            Gradient vector computed via finite differences
             
         Notes
         -----
-        Uses LU decomposition via LAPACK for numerical stability.
-        Automatically checks for singularity.
+        This maintains exact R compatibility for regulatory compliance.
+        The "approximate" gradient norms are intentional - this is how R works.
         """
-        try:
-            return linalg.inv(matrix, check_finite=True)
-        except linalg.LinAlgError as e:
-            from .base import NumericalError
-            raise NumericalError(f"Matrix is singular and cannot be inverted: {e}")
-    
-    def matmul(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """
-        Matrix multiplication using NumPy's optimized implementation.
+        if not callable(objective_func):
+            raise TypeError("objective_func must be callable")
         
-        Parameters
-        ----------
-        a, b : np.ndarray
-            Matrices to multiply
-            
-        Returns
-        -------
-        np.ndarray
-            Product a @ b
-            
-        Notes
-        -----
-        Uses np.matmul which automatically selects the best BLAS routine
-        and handles broadcasting correctly.
-        """
-        try:
-            return np.matmul(a, b)
-        except ValueError as e:
-            raise ValueError(f"Matrix multiplication failed: {e}")
-    
-    def to_cpu(self, array) -> np.ndarray:
-        """
-        Convert array to CPU (no-op for NumPy backend).
+        theta = np.asarray(theta, dtype=np.float64)
+        if theta.ndim != 1:
+            raise ValueError("theta must be 1-dimensional")
         
-        Parameters
-        ----------
-        array : np.ndarray
-            Array already on CPU
-            
-        Returns
-        -------
-        np.ndarray
-            Same array (no conversion needed)
-        """
-        return np.asarray(array)
-    
-    def asarray(self, array: Union[np.ndarray, list], dtype=None) -> np.ndarray:
-        """
-        Convert input to NumPy array.
-        
-        Parameters
-        ----------
-        array : array-like
-            Input array or list
-        dtype : data type, optional
-            Desired data type
-            
-        Returns
-        -------
-        np.ndarray
-            NumPy array
-        """
-        return np.asarray(array, dtype=dtype)
-    
-    def _get_blas_info(self) -> dict:
-        """Get BLAS/LAPACK configuration information."""
         try:
-            # Try multiple methods to get BLAS info
-            result = {
-                'library': 'unknown',
-                'version': 'unknown',
-                'threading': 'unknown'
-            }
+            # Evaluate at current point
+            f0 = objective_func(theta)
+            if not np.isfinite(f0):
+                raise GradientComputationError(f"Objective function returned {f0}")
             
-            # Method 1: Try numpy.show_config() - most reliable
-            try:
-                config = np.show_config(mode='dicts')
+            # Compute finite difference gradient
+            gradient = np.zeros_like(theta)
+            
+            for i in range(len(theta)):
+                # Forward step
+                theta_plus = theta.copy()
+                theta_plus[i] += step_size
+                f_plus = objective_func(theta_plus)
                 
-                # Check different possible keys
-                blas_keys = ['blas_info', 'blas_mkl_info', 'mkl_info', 'blas_opt_info']
-                blas_info = None
-                
-                for key in blas_keys:
-                    if key in config:
-                        blas_info = config[key]
-                        break
-                
-                if blas_info:
-                    # Extract library name
-                    if 'libraries' in blas_info:
-                        libs = blas_info['libraries']
-                        if isinstance(libs, list) and libs:
-                            lib_str = ' '.join(libs).lower()
-                        else:
-                            lib_str = str(libs).lower()
-                        
-                        # Identify BLAS library
-                        if 'mkl' in lib_str:
-                            result['library'] = 'Intel MKL'
-                        elif 'openblas' in lib_str:
-                            result['library'] = 'OpenBLAS'
-                        elif 'atlas' in lib_str:
-                            result['library'] = 'ATLAS'
-                        elif 'accelerate' in lib_str:
-                            result['library'] = 'Accelerate'
-                        elif 'blis' in lib_str:
-                            result['library'] = 'BLIS'
-                        else:
-                            result['library'] = f"Custom ({lib_str})"
+                if np.isfinite(f_plus):
+                    # Forward difference (preferred)
+                    gradient[i] = (f_plus - f0) / step_size
+                else:
+                    # Try backward step if forward fails
+                    theta_minus = theta.copy()
+                    theta_minus[i] -= step_size
+                    f_minus = objective_func(theta_minus)
                     
-                    # Try to extract version
-                    if 'version' in blas_info:
-                        result['version'] = str(blas_info['version'])
-                
-            except Exception:
-                pass
+                    if not np.isfinite(f_minus):
+                        raise GradientComputationError(
+                            f"Both forward and backward steps failed at parameter {i}"
+                        )
+                    
+                    # Backward difference
+                    gradient[i] = (f0 - f_minus) / step_size
             
-            # Method 2: Check numpy.__config__ if available
-            if result['library'] == 'unknown':
-                try:
-                    if hasattr(np, '__config__'):
-                        config = np.__config__
-                        if hasattr(config, 'blas_info'):
-                            blas_info = config.blas_info
-                            if blas_info and 'libraries' in blas_info:
-                                libs = str(blas_info['libraries']).lower()
-                                if 'mkl' in libs:
-                                    result['library'] = 'Intel MKL'
-                                elif 'openblas' in libs:
-                                    result['library'] = 'OpenBLAS'
-                except Exception:
-                    pass
+            return gradient
             
-            # Method 3: Try importing scipy and checking its BLAS
-            if result['library'] == 'unknown':
-                try:
-                    import scipy
-                    if hasattr(scipy, 'show_config'):
-                        config = scipy.show_config(mode='dicts')
-                        if 'blas_info' in config:
-                            blas_info = config['blas_info']
-                            if 'libraries' in blas_info:
-                                libs = str(blas_info['libraries']).lower()
-                                if 'mkl' in libs:
-                                    result['library'] = 'Intel MKL'
-                                elif 'openblas' in libs:
-                                    result['library'] = 'OpenBLAS'
-                except Exception:
-                    pass
-            
-            # Method 4: Try direct library detection via ctypes (last resort)
-            if result['library'] == 'unknown':
-                try:
-                    import ctypes.util
-                    # Look for common BLAS libraries
-                    for lib_name, display_name in [
-                        ('mkl_rt', 'Intel MKL'),
-                        ('openblas', 'OpenBLAS'),
-                        ('atlas', 'ATLAS'),
-                        ('accelerate', 'Accelerate')
-                    ]:
-                        if ctypes.util.find_library(lib_name):
-                            result['library'] = display_name
-                            break
-                except Exception:
-                    pass
-            
-            return result
-            
-        except Exception:
-            # If all methods fail, return basic unknown info
-            return {
-                'library': 'unknown',
-                'version': 'unknown', 
-                'threading': 'unknown'
-            }
-    
-    def _get_processor_count(self) -> int:
-        """Get number of available CPU cores."""
-        try:
-            import os
-            return os.cpu_count() or 1
-        except Exception:
-            return 1
-    
-    def get_device_info(self) -> dict:
-        """
-        Get CPU and BLAS information.
-        
-        Returns
-        -------
-        dict
-            Device information including CPU count and BLAS library details
-        """
-        return self.device_info.copy()
+        except Exception as e:
+            if isinstance(e, GradientComputationError):
+                raise
+            else:
+                raise GradientComputationError(f"Finite difference computation failed: {e}")
     
     def __repr__(self) -> str:
-        """String representation with BLAS info."""
-        blas_lib = self.device_info.get('blas_info', {}).get('library', 'unknown')
-        cpu_count = self.device_info.get('processor_count', 1)
-        return f"NumPyBackend(cpus={cpu_count}, blas='{blas_lib}')"
+        """Simple string representation."""
+        return f"NumPyBackend(available=True, method=finite_differences)"

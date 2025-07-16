@@ -37,8 +37,7 @@ from ._validation import (
 
 # Backend information (for advanced users)
 from ._backends import (
-    get_available_backends,
-    print_backend_summary
+    get_available_backends
 )
 
 # Make main functions available at package level
@@ -49,8 +48,7 @@ __all__ = [
     'datasets',
     'run_validation_suite',
     'create_validation_report',
-    'get_available_backends',
-    'print_backend_summary'
+    'get_available_backends'
 ]
 
 # Package-level docstring for regulatory documentation

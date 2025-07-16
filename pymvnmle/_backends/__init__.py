@@ -12,7 +12,7 @@ Advanced features (diagnostics, benchmarking, complex selection) come later.
 """
 
 from typing import List, Optional, Tuple
-from .base import BackendInterface, BackendNotAvailableError
+from .base import BackendInterface, GPUBackendBase, BackendNotAvailableError
 
 
 # Global registry of available backend classes
@@ -246,6 +246,10 @@ def get_backend_with_fallback(backend_name: str,
 
 # Export the essential functions only
 __all__ = [
-    'BackendInterface', 'BackendNotAvailableError',
-    'get_backend', 'get_backend_with_fallback', 'get_available_backends'
+    'BackendInterface',
+    'GPUBackendBase',  # <-- ADD THIS LINE
+    'BackendNotAvailableError',
+    'get_available_backends',
+    'select_backend',
+    'get_backend'
 ]

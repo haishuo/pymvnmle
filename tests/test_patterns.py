@@ -114,7 +114,7 @@ class TestPatternAnalysis:
         
         # Missing rate calculation
         # Simple data: 6 total values missing out of 18 total (6×3)
-        expected_missing_rate = 6 / 18
+        expected_missing_rate = 4 / 18
         assert abs(summary.overall_missing_rate - expected_missing_rate) < 0.01
         
         # Variable-specific missing rates

@@ -1,44 +1,65 @@
 """
-Abstract backend interface for PyMVNMLE
-Defines the contract that all computational backends must implement
+Abstract backend interfaces for PyMVNMLE v2.0
+Pure abstract base classes defining the computational contracts
+
+DESIGN PRINCIPLE: Unix Philosophy - "Do one thing and do it well"
+This module contains ONLY abstract interface definitions. No implementation,
+no utilities, no diagnostics, no validation - just pure contracts.
+
+All concrete functionality belongs in separate, focused modules:
+- Validation → _backends/validation.py
+- Benchmarking → _backends/benchmarking.py  
+- Diagnostics → _utils/system_info.py
+- Error handling → Custom exception classes only
 """
 
 from abc import ABC, abstractmethod
 import numpy as np
-from typing import Tuple, Optional, Union
+from typing import Tuple, Callable
 
 
 class BackendInterface(ABC):
     """
-    Abstract interface for computational backends.
+    Pure abstract interface for all computational backends.
     
-    All backends (NumPy, CuPy, Metal, JAX) must implement these methods
-    to provide consistent linear algebra operations for ML estimation.
-    
-    The interface is designed around the core operations needed for
-    multivariate normal maximum likelihood estimation:
-    - Cholesky decomposition (for parameterization)
-    - Triangular system solving (for likelihood computation)
-    - Log-determinant computation (for likelihood)
-    - Matrix operations (inversion, multiplication)
+    Defines the minimal contract that all backends (CPU and GPU) must implement
+    for multivariate normal maximum likelihood estimation with missing data.
     
     Design Principles:
-    - All methods accept NumPy arrays as input
-    - All methods return NumPy arrays as output (via to_cpu if needed)
-    - Backends handle their own memory management internally
-    - Error handling should be consistent across backends
-    """
+    1. Interface only - no implementation details
+    2. Minimal surface area - only essential operations
+    3. NumPy arrays at boundaries - consistent input/output types
+    4. Mathematical focus - operations needed for MLE computation
     
-    def __init__(self):
-        """Initialize the backend and check availability."""
-        self.available = False  # Set to True in subclass if backend works
-        self.name = "base"      # Override in subclasses
-        self.device_info = {}   # Backend-specific device information
+    The interface covers exactly four core mathematical operations:
+    - Cholesky decomposition (for inverse Cholesky parameterization)
+    - Triangular system solving (for likelihood computation)  
+    - Log-determinant computation (for log-likelihood evaluation)
+    - Gradient computation (finite differences or autodiff)
+    """
     
     @property
     @abstractmethod
     def is_available(self) -> bool:
         """Check if this backend is available on the current system."""
+        pass
+    
+    @property
+    @abstractmethod  
+    def name(self) -> str:
+        """Get the backend name."""
+        pass
+    
+    @abstractmethod
+    def gradient_method(self) -> str:
+        """
+        Return the gradient computation method.
+        
+        Returns
+        -------
+        str
+            Either 'finite_differences' or 'autodiff'
+        """
         pass
     
     @abstractmethod
@@ -48,52 +69,47 @@ class BackendInterface(ABC):
         
         Parameters
         ----------
-        matrix : np.ndarray
+        matrix : np.ndarray, shape (n, n)
             Positive definite matrix to decompose
         upper : bool, default=True
-            If True, return upper triangular factor (U where A = U.T @ U)
-            If False, return lower triangular factor (L where A = L @ L.T)
+            If True, return upper triangular factor U where A = U.T @ U
+            If False, return lower triangular factor L where A = L @ L.T
             
         Returns
         -------
-        np.ndarray
+        np.ndarray, shape (n, n)
             Cholesky factor as NumPy array
             
         Notes
         -----
-        This is critical for our inverse Cholesky parameterization.
+        Critical for inverse Cholesky parameterization: Σ = (Δ⁻¹)ᵀ Δ⁻¹
         Must handle near-singular matrices gracefully.
         """
         pass
     
     @abstractmethod
     def solve_triangular(self, a: np.ndarray, b: np.ndarray, 
-                        upper: bool = True, trans: str = 'N') -> np.ndarray:
+                        lower: bool = False) -> np.ndarray:
         """
-        Solve triangular system ax = b.
+        Solve triangular linear system ax = b.
         
         Parameters
         ----------
-        a : np.ndarray
-            Triangular matrix (2D)
-        b : np.ndarray  
-            Right-hand side (1D or 2D)
-        upper : bool, default=True
-            Whether a is upper or lower triangular
-        trans : str, default='N'
-            'N': solve ax = b
-            'T': solve a.T x = b
-            'C': solve a.H x = b (conjugate transpose)
+        a : np.ndarray, shape (n, n)
+            Triangular matrix (upper or lower)
+        b : np.ndarray, shape (n,) or (n, k)
+            Right-hand side vector(s)
+        lower : bool, default=False
+            True if 'a' is lower triangular, False if upper triangular
             
         Returns
         -------
-        np.ndarray
-            Solution x as NumPy array
+        np.ndarray, shape (n,) or (n, k)
+            Solution to the triangular system
             
         Notes
         -----
-        Used extensively in likelihood computation for solving
-        with Cholesky factors.
+        Used extensively in likelihood computation for pattern-specific calculations.
         """
         pass
     
@@ -104,217 +120,117 @@ class BackendInterface(ABC):
         
         Parameters
         ----------
-        matrix : np.ndarray
+        matrix : np.ndarray, shape (n, n)
             Square matrix
             
         Returns
         -------
         sign : float
-            Sign of the determinant (+1, -1, or 0)
+            Sign of the determinant (-1, 0, or 1)
         logdet : float
             Natural logarithm of absolute determinant
             
         Notes
         -----
-        Critical for likelihood computation. Should handle
-        near-singular matrices by returning appropriate values.
+        Essential for log-likelihood computation.
         For positive definite matrices, sign should always be +1.
         """
         pass
     
     @abstractmethod
-    def inv(self, matrix: np.ndarray) -> np.ndarray:
+    def compute_gradient(self, objective_func: Callable, theta: np.ndarray, 
+                        **kwargs) -> np.ndarray:
         """
-        Compute matrix inverse.
+        Compute gradient of objective function at given parameter vector.
         
         Parameters
         ----------
-        matrix : np.ndarray
-            Invertible square matrix
+        objective_func : callable
+            Function that takes parameter vector and returns scalar objective value
+        theta : np.ndarray, shape (n_params,)
+            Parameter vector at which to evaluate gradient
+        **kwargs : dict
+            Backend-specific arguments
             
         Returns
         -------
-        np.ndarray
-            Matrix inverse as NumPy array
+        np.ndarray, shape (n_params,)
+            Gradient vector
             
         Notes
         -----
-        Used for converting between parameterizations.
-        Should use stable algorithms (e.g., LU decomposition).
+        Implementation varies by backend:
+        - CPU backends: Use finite differences 
+        - GPU backends: Use autodiff for analytical gradients
+        
+        This is the key method that enables the two-track system.
         """
         pass
-    
-    @abstractmethod
-    def matmul(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """
-        Matrix multiplication.
-        
-        Parameters
-        ----------
-        a, b : np.ndarray
-            Matrices to multiply
-            
-        Returns
-        -------
-        np.ndarray
-            Product a @ b as NumPy array
-        """
-        pass
-    
-    @abstractmethod
-    def to_cpu(self, array) -> np.ndarray:
-        """
-        Transfer array to CPU memory as NumPy array.
-        
-        Parameters
-        ----------
-        array : backend-specific array type
-            Array in backend's native format (CuPy array, JAX array, etc.)
-            
-        Returns
-        -------
-        np.ndarray
-            Array converted to NumPy format on CPU
-            
-        Notes
-        -----
-        For NumPy backend, this is a no-op.
-        For GPU backends, this transfers from GPU to CPU memory.
-        Critical for returning results to user in consistent format.
-        """
-        pass
-    
-    @abstractmethod
-    def asarray(self, array: Union[np.ndarray, list], dtype=None) -> object:
-        """
-        Convert input to backend's native array format.
-        
-        Parameters
-        ----------
-        array : array-like
-            Input array or list
-        dtype : data type, optional
-            Desired data type
-            
-        Returns
-        -------
-        backend-specific array type
-            Array in backend's native format
-            
-        Notes
-        -----
-        Converts NumPy arrays to backend format (CuPy, JAX, etc.)
-        Used at start of each operation.
-        """
-        pass
-    
-    def get_device_info(self) -> dict:
-        """
-        Get information about computational device(s).
-        
-        Returns
-        -------
-        dict
-            Device information including:
-            - device_type: 'cpu', 'cuda', 'metal', 'tpu'
-            - device_count: number of devices
-            - memory_info: available memory (if applicable)
-            - backend_version: version of backend library
-        """
-        return self.device_info.copy()
-    
-    def benchmark_operation(self, operation_name: str, 
-                          matrix_size: int = 1000) -> float:
-        """
-        Benchmark a basic operation for performance testing.
-        
-        Parameters
-        ----------
-        operation_name : str
-            Name of operation to benchmark ('cholesky', 'matmul', etc.)
-        matrix_size : int, default=1000
-            Size of test matrices
-            
-        Returns
-        -------
-        float
-            Time in seconds for the operation
-            
-        Notes
-        -----
-        Used for backend auto-selection based on performance.
-        Should run a standardized test for fair comparison.
-        """
-        import time
-        
-        # Generate test data
-        np.random.seed(42)  # Reproducible benchmarks
-        test_matrix = np.random.randn(matrix_size, matrix_size)
-        test_matrix = test_matrix @ test_matrix.T  # Make positive definite
-        
-        # For Metal backend, use float32 to avoid MPS dtype limitations
-        if self.name == "metal":
-            test_matrix = test_matrix.astype(np.float32)
-        
-        # Convert to backend format
-        backend_matrix = self.asarray(test_matrix)
-        
-        # Benchmark the requested operation
-        start_time = time.time()
-        
-        if operation_name == 'cholesky':
-            result = self.cholesky(test_matrix)
-        elif operation_name == 'matmul':
-            result = self.matmul(backend_matrix, backend_matrix)
-        elif operation_name == 'inv':
-            result = self.inv(test_matrix)
-        elif operation_name == 'slogdet':
-            result = self.slogdet(test_matrix)
-        else:
-            raise ValueError(f"Unknown operation: {operation_name}")
-            
-        end_time = time.time()
-        
-        # Ensure computation completed (for async backends)
-        if hasattr(result, 'block_until_ready'):
-            result.block_until_ready()
-            
-        return end_time - start_time
-    
-    def validate_positive_definite(self, matrix: np.ndarray, 
-                                 name: str = "matrix") -> None:
-        """
-        Validate that matrix is positive definite.
-        
-        Parameters
-        ----------
-        matrix : np.ndarray
-            Matrix to validate
-        name : str
-            Name for error messages
-            
-        Raises
-        ------
-        ValueError
-            If matrix is not positive definite
-        """
-        if matrix.ndim != 2:
-            raise ValueError(f"{name} must be 2-dimensional")
-            
-        if matrix.shape[0] != matrix.shape[1]:
-            raise ValueError(f"{name} must be square")
-            
-        # Check eigenvalues are positive
-        eigenvals = np.linalg.eigvals(matrix)
-        if np.any(eigenvals <= 0):
-            raise ValueError(f"{name} is not positive definite")
-    
-    def __repr__(self) -> str:
-        """String representation of backend."""
-        status = "available" if self.is_available else "unavailable"
-        return f"{self.__class__.__name__}(name='{self.name}', status='{status}')"
 
 
+class GPUBackendBase(BackendInterface):
+    """
+    Abstract base class for GPU backends.
+    
+    Provides the contract for GPU-specific functionality while maintaining
+    the core BackendInterface. GPU backends inherit common behavior patterns
+    through this base class.
+    
+    Key Responsibilities:
+    1. Define GPU-specific abstract methods
+    2. Establish inheritance hierarchy for code reuse
+    3. Declare autodiff gradient computation capability
+    
+    Inheritance Hierarchy:
+    BackendInterface (pure interface)
+    └── GPUBackendBase (GPU-specific interface)
+        ├── PyTorchBackend (CUDA, Metal, Intel GPU)
+        ├── JAXBackend (XLA compilation, TPU support)
+        └── [Future GPU backends]
+    """
+    
+    def gradient_method(self) -> str:
+        """GPU backends use analytical gradients."""
+        return 'autodiff'
+    
+    @abstractmethod
+    def _create_tensor(self, array: np.ndarray, requires_grad: bool = False):
+        """
+        Create tensor appropriate for this backend.
+        
+        Parameters
+        ----------
+        array : np.ndarray
+            NumPy array to convert to tensor
+        requires_grad : bool, default=False
+            Whether tensor should track gradients for autodiff
+            
+        Returns
+        -------
+        tensor
+            Backend-specific tensor type
+        """
+        pass
+    
+    @abstractmethod
+    def _tensor_to_numpy(self, tensor) -> np.ndarray:
+        """
+        Convert tensor back to NumPy array.
+        
+        Parameters
+        ----------
+        tensor
+            Backend-specific tensor
+            
+        Returns
+        -------
+        np.ndarray
+            NumPy array on CPU
+        """
+        pass
+
+
+# Custom exception classes for backend operations
 class BackendError(Exception):
     """Base exception for backend-related errors."""
     pass
@@ -327,4 +243,9 @@ class BackendNotAvailableError(BackendError):
 
 class NumericalError(BackendError):
     """Raised when numerical computation fails (e.g., non-positive definite matrix)."""
+    pass
+
+
+class GradientComputationError(BackendError):
+    """Raised when gradient computation fails (finite differences or autodiff)."""
     pass

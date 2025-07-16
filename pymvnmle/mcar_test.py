@@ -25,31 +25,10 @@ import warnings
 
 # Import from other PyMVNMLE modules
 from .mlest import mlest
+from .patterns import PatternInfo, identify_missingness_patterns
 
 
 @dataclass
-class PatternInfo:
-    """Information about a single missingness pattern."""
-    pattern_id: int
-    observed_indices: np.ndarray  # Which variables are observed
-    missing_indices: np.ndarray   # Which variables are missing
-    n_cases: int                  # Number of cases with this pattern
-    data: np.ndarray             # Data for cases with this pattern
-    pattern_vector: np.ndarray   # Binary pattern (1=observed, 0=missing)
-    
-    @property
-    def n_observed(self) -> int:
-        """Number of observed variables in this pattern."""
-        return len(self.observed_indices)
-    
-    @property
-    def percent_cases(self) -> float:
-        """Percentage of total cases with this pattern."""
-        # Will be set by the parent function
-        return getattr(self, '_percent_cases', 0.0)
-
-
-@dataclass 
 class MCARTestResult:
     """
     Result of Little's MCAR test.
@@ -151,76 +130,6 @@ class MCARTestResult:
             ])
         
         return "\n".join(summary_lines)
-
-
-def identify_missingness_patterns(data: np.ndarray) -> List[PatternInfo]:
-    """
-    Identify and extract all unique missingness patterns in the data.
-    
-    This implements the pattern identification similar to R's approach,
-    grouping observations by their pattern of missing values.
-    
-    Parameters
-    ----------
-    data : np.ndarray
-        Data matrix with missing values as np.nan
-        
-    Returns
-    -------
-    List[PatternInfo]
-        Information about each unique pattern
-    """
-    n_obs, n_vars = data.shape
-    
-    # Create binary pattern matrix (1 = observed, 0 = missing)
-    pattern_matrix = (~np.isnan(data)).astype(int)
-    
-    # Convert patterns to unique identifiers (like R's approach)
-    # Use powers of 2 to create unique decimal representation
-    powers = 2 ** np.arange(n_vars - 1, -1, -1)
-    pattern_ids = pattern_matrix @ powers
-    
-    # Find unique patterns
-    unique_patterns, inverse_indices = np.unique(pattern_ids, return_inverse=True)
-    
-    # Build PatternInfo for each unique pattern
-    patterns = []
-    for i, pattern_id in enumerate(unique_patterns):
-        # Find cases with this pattern
-        case_mask = (pattern_ids == pattern_id)
-        pattern_data = data[case_mask]
-        
-        # Get the actual pattern vector
-        pattern_idx = np.where(pattern_ids == pattern_id)[0][0]
-        pattern_vector = pattern_matrix[pattern_idx]
-        
-        # Indices of observed/missing variables
-        observed_indices = np.where(pattern_vector == 1)[0]
-        missing_indices = np.where(pattern_vector == 0)[0]
-        
-        # Extract only observed columns for this pattern
-        pattern_data_obs = pattern_data[:, observed_indices]
-        
-        pattern_info = PatternInfo(
-            pattern_id=i + 1,  # 1-indexed for readability
-            observed_indices=observed_indices,
-            missing_indices=missing_indices,
-            n_cases=int(np.sum(case_mask)),
-            data=pattern_data_obs,
-            pattern_vector=pattern_vector
-        )
-        
-        patterns.append(pattern_info)
-    
-    # Sort by number of cases (descending)
-    patterns.sort(key=lambda p: p.n_cases, reverse=True)
-    
-    # Add percentage information
-    total_cases = n_obs
-    for pattern in patterns:
-        pattern._percent_cases = (pattern.n_cases / total_cases) * 100
-    
-    return patterns
 
 
 def regularized_inverse(matrix: np.ndarray, 
@@ -503,6 +412,7 @@ def little_mcar_test(data: Union[np.ndarray, pd.DataFrame],
     return result
 
 
+# Convenience functions for backward compatibility
 def analyze_patterns(data: Union[np.ndarray, pd.DataFrame]) -> List[PatternInfo]:
     """
     Analyze missingness patterns in the data.
@@ -520,42 +430,13 @@ def analyze_patterns(data: Union[np.ndarray, pd.DataFrame]) -> List[PatternInfo]
     List[PatternInfo]
         Information about each missingness pattern
     """
-    if isinstance(data, pd.DataFrame):
-        data_array = data.values.astype(float)
-    else:
-        data_array = np.asarray(data, dtype=float)
-    
-    return identify_missingness_patterns(data_array)
-
-
-@dataclass
-class PatternSummary:
-    """Summary statistics for missingness patterns."""
-    n_patterns: int
-    total_cases: int
-    overall_missing_rate: float
-    most_common_pattern: PatternInfo
-    complete_cases: int
-    complete_cases_percent: float
-    variable_missing_rates: Dict[int, float]
-    
-    def __str__(self) -> str:
-        """String representation of pattern summary."""
-        lines = [
-            f"Missingness Pattern Summary",
-            f"=" * 40,
-            f"Total patterns: {self.n_patterns}",
-            f"Total cases: {self.total_cases}",
-            f"Overall missing rate: {self.overall_missing_rate:.1%}",
-            f"Complete cases: {self.complete_cases} ({self.complete_cases_percent:.1%})",
-            f"Most common pattern: {self.most_common_pattern.n_cases} cases "
-            f"({self.most_common_pattern.percent_cases:.1%})"
-        ]
-        return "\n".join(lines)
+    # Import from patterns module to avoid circular imports
+    from .patterns import analyze_patterns as _analyze_patterns
+    return _analyze_patterns(data)
 
 
 def pattern_summary(patterns: List[PatternInfo], 
-                   data_shape: Optional[Tuple[int, int]] = None) -> PatternSummary:
+                   data_shape: Optional[Tuple[int, int]] = None):
     """
     Generate summary statistics for missingness patterns.
     
@@ -571,46 +452,6 @@ def pattern_summary(patterns: List[PatternInfo],
     PatternSummary
         Summary statistics
     """
-    n_patterns = len(patterns)
-    total_cases = sum(p.n_cases for p in patterns)
-    
-    # Find complete cases pattern
-    complete_pattern = None
-    for p in patterns:
-        if len(p.missing_indices) == 0:
-            complete_pattern = p
-            break
-    
-    complete_cases = complete_pattern.n_cases if complete_pattern else 0
-    complete_cases_percent = complete_cases / total_cases if total_cases > 0 else 0
-    
-    # Most common pattern
-    most_common = max(patterns, key=lambda p: p.n_cases)
-    
-    # Overall missing rate (need original data or shape)
-    if data_shape:
-        n_obs, n_vars = data_shape
-        total_values = n_obs * n_vars
-        observed_values = sum(p.n_cases * p.n_observed for p in patterns)
-        overall_missing_rate = 1 - (observed_values / total_values)
-    else:
-        overall_missing_rate = np.nan
-    
-    # Variable-specific missing rates
-    variable_missing_rates = {}
-    if data_shape:
-        n_vars = data_shape[1]
-        for var_idx in range(n_vars):
-            var_observed = sum(p.n_cases for p in patterns 
-                             if var_idx in p.observed_indices)
-            variable_missing_rates[var_idx] = 1 - (var_observed / total_cases)
-    
-    return PatternSummary(
-        n_patterns=n_patterns,
-        total_cases=total_cases,
-        overall_missing_rate=overall_missing_rate,
-        most_common_pattern=most_common,
-        complete_cases=complete_cases,
-        complete_cases_percent=complete_cases_percent,
-        variable_missing_rates=variable_missing_rates
-    )
+    # Import from patterns module to avoid circular imports
+    from .patterns import pattern_summary as _pattern_summary
+    return _pattern_summary(patterns, data_shape)

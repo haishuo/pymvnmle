@@ -83,7 +83,6 @@ def mysort_data(data: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     
     return sorted_data, freq, presence_absence
 
-
 def validate_input_data(data: Union[np.ndarray, pd.DataFrame]) -> np.ndarray:
     """
     Validate and preprocess input data for ML estimation.
@@ -105,8 +104,6 @@ def validate_input_data(data: Union[np.ndarray, pd.DataFrame]) -> np.ndarray:
     ------
     ValueError
         If data format is invalid for MLE computation
-    TypeError
-        If data contains non-numeric values
         
     Notes
     -----
@@ -123,58 +120,57 @@ def validate_input_data(data: Union[np.ndarray, pd.DataFrame]) -> np.ndarray:
         var_names = data.columns.tolist()
     else:
         data_array = np.asarray(data)
-        var_names = [f"Variable_{i}" for i in range(data_array.shape[1] if data_array.ndim > 1 else 1)]
+        var_names = None  # Will create names later if needed
     
-    # Ensure numeric data
-    if not np.issubdtype(data_array.dtype, np.number):
-        raise TypeError("Data must contain numeric values only")
-    
-    # Convert to float64 for numerical precision
-    data_array = data_array.astype(np.float64)
-    
-    # Validate dimensionality
+    # Dimensionality check
     if data_array.ndim != 2:
-        raise ValueError("Data must be a 2D array (observations × variables)")
+        raise ValueError(f"Data must be a 2D array (observations × variables), got {data_array.ndim}D")
     
     n_obs, n_vars = data_array.shape
     
-    # Check minimum size requirements
+    # Create variable names if not from DataFrame
+    if var_names is None:
+        var_names = [f"Variable_{i}" for i in range(n_vars)]
+    
+    # Ensure numeric data - CHANGED FROM TypeError TO ValueError
+    if not np.issubdtype(data_array.dtype, np.number):
+        raise ValueError("Data must contain numeric values only")
+    
+    # Convert to float64
+    data_array = data_array.astype(np.float64)
+    
+    # Sample size validation
     if n_obs < 2:
-        raise ValueError("Need at least 2 observations for estimation")
+        raise ValueError(f"Need at least 2 observations for estimation, got {n_obs}")
     
     if n_vars < 1:
-        raise ValueError("Need at least 1 variable for estimation")
+        raise ValueError(f"Need at least 1 variable, got {n_vars}")
     
-    # Check for completely missing variables
-    for j in range(n_vars):
-        if np.isnan(data_array[:, j]).all():
-            var_name = var_names[j] if j < len(var_names) else f"Variable_{j}"
-            raise ValueError(f"Variable '{var_name}' is completely missing")
+    # Check for infinite values BEFORE other validations
+    non_finite_mask = ~np.isfinite(data_array) & ~np.isnan(data_array)
+    if np.any(non_finite_mask):
+        # Find location of first infinite value for helpful error message
+        inf_locations = np.where(non_finite_mask)
+        first_row, first_col = inf_locations[0][0], inf_locations[1][0]
+        raise ValueError(f"Data contains infinite values (first at row {first_row}, column {first_col})")
     
     # Check for completely missing observations
-    completely_missing = np.isnan(data_array).all(axis=1)
-    if completely_missing.all():
-        raise ValueError("All observations are completely missing")
-    
-    # Remove completely missing observations if any exist
-    if completely_missing.any():
+    completely_missing = np.all(np.isnan(data_array), axis=1)
+    if np.any(completely_missing):
         n_missing = np.sum(completely_missing)
         warnings.warn(f"Removing {n_missing} completely missing observations")
         data_array = data_array[~completely_missing]
+        n_obs = data_array.shape[0]
         
-        if data_array.shape[0] < 2:
-            raise ValueError("Too few observations after removing completely missing cases")
+        if n_obs < 2:
+            raise ValueError("Too few observations after removing completely missing rows")
     
-    # Check for sufficient variability
-    for j in range(n_vars):
-        observed_values = data_array[~np.isnan(data_array[:, j]), j]
-        if len(observed_values) < 2:
-            var_name = var_names[j] if j < len(var_names) else f"Variable_{j}"
-            raise ValueError(f"Variable '{var_name}' has fewer than 2 observed values")
-        
-        if np.var(observed_values) == 0:
-            var_name = var_names[j] if j < len(var_names) else f"Variable_{j}"
-            warnings.warn(f"Variable '{var_name}' has zero variance")
+    # Check for completely missing variables
+    completely_missing_vars = np.all(np.isnan(data_array), axis=0)
+    if np.any(completely_missing_vars):
+        missing_var_indices = np.where(completely_missing_vars)[0]
+        missing_var_names = [var_names[i] for i in missing_var_indices]
+        raise ValueError(f"Variable '{missing_var_names[0]}' is completely missing")
     
     return data_array
 

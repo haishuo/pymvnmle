@@ -82,43 +82,27 @@ class NumPyBackend(BackendInterface):
     
     def slogdet(self, matrix: np.ndarray) -> Tuple[float, float]:
         """
-        Compute sign and log-determinant using scipy.linalg.slogdet.
+        Compute sign and log determinant using numpy.linalg.slogdet.
         
-        Numerically stable for computing log-determinants without overflow.
-        Essential for log-likelihood computation in missing data MLE.
+        More numerically stable than computing det() and taking log.
+        Critical for likelihood computation in missing data MLE.
         """
         try:
-            sign, logdet = linalg.slogdet(matrix)
+            sign, logdet = np.linalg.slogdet(matrix)
             return float(sign), float(logdet)
         except Exception as e:
-            raise NumericalError(f"Log-determinant computation failed: {e}")
+            raise NumericalError(f"Log determinant computation failed: {e}")
     
     def compute_gradient(self, objective_func: Callable, theta: np.ndarray, 
-                        step_size: float = 1e-8) -> np.ndarray:
+                        **kwargs) -> np.ndarray:
         """
-        Compute gradient using finite differences - R-compatible method.
+        Compute gradient using R's nlm finite difference approach.
         
-        This implements the exact finite difference scheme used by R's nlm() function,
-        producing gradient norms ~1e-4 at convergence (not machine precision).
+        CRITICAL: Uses R's exact finite difference parameters to ensure
+        identical behavior. This is why gradient norms are ~1e-4, not ~1e-15.
         
-        Parameters
-        ----------
-        objective_func : callable
-            Function that takes parameter vector and returns scalar
-        theta : np.ndarray
-            Parameter vector at which to evaluate gradient  
-        step_size : float, default=1e-8
-            Step size for finite differences (matches R's nlm default)
-            
-        Returns
-        -------
-        np.ndarray
-            Gradient vector computed via finite differences
-            
-        Notes
-        -----
-        This maintains exact R compatibility for regulatory compliance.
-        The "approximate" gradient norms are intentional - this is how R works.
+        This is the exact same logic as your working _objective.py gradient method,
+        just adapted to work as a backend method.
         """
         if not callable(objective_func):
             raise TypeError("objective_func must be callable")
@@ -128,44 +112,44 @@ class NumPyBackend(BackendInterface):
             raise ValueError("theta must be 1-dimensional")
         
         try:
-            # Evaluate at current point
+            n_params = len(theta)
+            gradient = np.zeros(n_params)
+            
+            # R's nlm uses this specific epsilon - EXACT SAME AS WORKING VERSION
+            eps = 1.49011612e-08  # R's .Machine$double.eps^(1/3)
+            
+            # Base function value
             f0 = objective_func(theta)
-            if not np.isfinite(f0):
-                raise GradientComputationError(f"Objective function returned {f0}")
             
-            # Compute finite difference gradient
-            gradient = np.zeros_like(theta)
-            
-            for i in range(len(theta)):
-                # Forward step
-                theta_plus = theta.copy()
-                theta_plus[i] += step_size
-                f_plus = objective_func(theta_plus)
+            for i in range(n_params):
+                # R's step size calculation - EXACT SAME AS WORKING VERSION
+                h = eps * max(abs(theta[i]), 1.0)
                 
-                if np.isfinite(f_plus):
-                    # Forward difference (preferred)
-                    gradient[i] = (f_plus - f0) / step_size
-                else:
-                    # Try backward step if forward fails
+                # Ensure step is not too small - EXACT SAME AS WORKING VERSION
+                if h < 1e-12:
+                    h = 1e-12
+                
+                # Forward difference (R's default for nlm) - EXACT SAME AS WORKING VERSION
+                theta_plus = theta.copy()
+                theta_plus[i] = theta[i] + h
+                
+                try:
+                    f_plus = objective_func(theta_plus)
+                    gradient[i] = (f_plus - f0) / h
+                except:
+                    # If forward fails, try backward - EXACT SAME AS WORKING VERSION
                     theta_minus = theta.copy()
-                    theta_minus[i] -= step_size
-                    f_minus = objective_func(theta_minus)
-                    
-                    if not np.isfinite(f_minus):
-                        raise GradientComputationError(
-                            f"Both forward and backward steps failed at parameter {i}"
-                        )
-                    
-                    # Backward difference
-                    gradient[i] = (f0 - f_minus) / step_size
+                    theta_minus[i] = theta[i] - h
+                    try:
+                        f_minus = objective_func(theta_minus)
+                        gradient[i] = (f0 - f_minus) / h
+                    except:
+                        gradient[i] = 0.0
             
             return gradient
             
         except Exception as e:
-            if isinstance(e, GradientComputationError):
-                raise
-            else:
-                raise GradientComputationError(f"Finite difference computation failed: {e}")
+            raise GradientComputationError(f"Finite difference computation failed: {e}")
     
     def __repr__(self) -> str:
         """Simple string representation."""

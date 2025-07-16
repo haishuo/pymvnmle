@@ -160,60 +160,102 @@ class MVNMLEObjective:
         """
         Get initial parameter estimates using R-compatible method.
         
-        Uses simple moment estimates converted to inverse Cholesky parameterization.
-        Critical: maintains R's exact parameter ordering.
+        Uses pairwise complete observations to compute starting covariance,
+        exactly matching R's getstartvals() function and V1.5 behavior.
         
         Returns
         -------
         np.ndarray
-            Initial parameter vector θ₀ in R's format
+            Parameter vector in R's format:
+            [μ₁, ..., μₚ, log(δ₁₁), ..., log(δₚₚ), δ₁₂, δ₁₃, δ₂₃, ...]
         """
-        # Initial mean estimates (overall sample means, ignoring missingness)
-        mu_init = np.nanmean(self.original_data, axis=0)
+        # Step 1: Compute sample means (unchanged)
+        mu_start = np.nanmean(self.original_data, axis=0)
         
-        # Initial covariance estimate (diagonal with small off-diagonals)
-        sigma_init = np.eye(self.n_vars)
+        # Step 2: Compute pairwise complete sample covariance (CRITICAL FIX)
+        cov_sample = np.zeros((self.n_vars, self.n_vars))
         
-        # Set diagonal to sample variances where possible
-        for j in range(self.n_vars):
-            var_j = np.nanvar(self.original_data[:, j], ddof=1)
-            if np.isfinite(var_j) and var_j > 0:
-                sigma_init[j, j] = var_j
-            else:
-                sigma_init[j, j] = 1.0  # Safe fallback
+        for i in range(self.n_vars):
+            for j in range(i, self.n_vars):
+                # Find pairwise complete observations
+                mask = ~(np.isnan(self.original_data[:, i]) | np.isnan(self.original_data[:, j]))
+                n_complete = np.sum(mask)
+                
+                if n_complete > 1:
+                    if i == j:
+                        # Variance
+                        cov_sample[i, i] = np.var(self.original_data[mask, i], ddof=1)
+                    else:
+                        # Covariance - THIS CAPTURES THE CORRELATIONS!
+                        cov_ij = np.cov(self.original_data[mask, i], 
+                                    self.original_data[mask, j], ddof=1)[0, 1]
+                        cov_sample[i, j] = cov_ij
+                        cov_sample[j, i] = cov_ij
+                else:
+                    # No complete pairs, use defaults
+                    if i == j:
+                        cov_sample[i, i] = 1.0
+                    else:
+                        cov_sample[i, j] = 0.0
+                        cov_sample[j, i] = 0.0
         
-        # Convert to inverse Cholesky parameterization
+        # Step 3: Regularize to ensure positive definiteness (R's approach)
+        eigenvals, eigenvecs = np.linalg.eigh(cov_sample)
+        
+        # Find smallest positive eigenvalue
+        pos_eigenvals = eigenvals[eigenvals > 0]
+        if len(pos_eigenvals) > 0:
+            min_pos = np.min(pos_eigenvals)
+        else:
+            min_pos = 1.0
+        
+        # Regularize: any eigenvalue < eps * min_pos becomes eps * min_pos
+        eps = 1e-3  # R's default
+        threshold = eps * min_pos
+        regularized_eigenvals = np.maximum(eigenvals, threshold)
+        
+        # Reconstruct regularized covariance
+        cov_regularized = eigenvecs @ np.diag(regularized_eigenvals) @ eigenvecs.T
+        
+        # Step 4: Get Cholesky factor (R uses upper triangular)
         try:
-            # Cholesky: σ = L L^T, so Δ = L^(-1)
-            L = np.linalg.cholesky(sigma_init)
-            Delta = np.linalg.inv(L)
+            L = np.linalg.cholesky(cov_regularized)
+            chol_upper = L.T
         except np.linalg.LinAlgError:
-            # Fallback: identity-based initialization
-            Delta = np.eye(self.n_vars)
+            # Fallback: add more regularization
+            cov_regularized += np.eye(self.n_vars) * 1e-6
+            L = np.linalg.cholesky(cov_regularized)
+            chol_upper = L.T
         
-        # Pack into parameter vector (R's exact ordering)
-        theta_init = np.zeros(self.n_params)
+        # Step 5: Compute inverse Cholesky factor (Delta)
+        try:
+            Delta_start = np.linalg.solve(chol_upper, np.eye(self.n_vars))
+        except np.linalg.LinAlgError:
+            # Fallback to pseudoinverse
+            Delta_start = np.linalg.pinv(chol_upper)
+        
+        # Ensure positive diagonal (R's sign adjustment)
+        for i in range(self.n_vars):
+            if Delta_start[i, i] < 0:
+                Delta_start[i, :] *= -1
+        
+        # Step 6: Pack into parameter vector (R's exact ordering)
+        theta = np.zeros(self.n_params)
         
         # Mean parameters
-        theta_init[:self.n_vars] = mu_init
+        theta[:self.n_vars] = mu_start
         
-        # Log-diagonal parameters (ensures positivity)
-        log_diag = np.log(np.diag(Delta))
-        # Bound to prevent overflow (R uses similar bounds)
-        log_diag = np.clip(log_diag, -5.0, 5.0)
-        theta_init[self.n_vars:2*self.n_vars] = log_diag
+        # Log diagonal of Delta
+        theta[self.n_vars:2*self.n_vars] = np.log(np.diag(Delta_start))
         
-        # Off-diagonal parameters (R's column-major ordering)
-        idx = 2 * self.n_vars
-        for j in range(self.n_vars):      # Column
-            for i in range(j):            # Row within column (upper triangle)
-                value = Delta[i, j]
-                # Bound off-diagonals (R uses similar bounds)
-                value = np.clip(value, -10.0, 10.0)
-                theta_init[idx] = value
-                idx += 1
+        # Off-diagonal elements of Delta (R's ordering: by column)
+        param_idx = 2 * self.n_vars
+        for j in range(1, self.n_vars):
+            for i in range(j):
+                theta[param_idx] = Delta_start[i, j]
+                param_idx += 1
         
-        return theta_init
+        return theta
     
     def _reconstruct_delta_matrix(self, theta: Union[np.ndarray, "torch.Tensor"], 
                                  array_lib=np) -> Union[np.ndarray, "torch.Tensor"]:
@@ -396,7 +438,7 @@ class MVNMLEObjective:
             sigma = np.eye(self.n_vars)
         
         # Compute log-likelihood
-        loglik = -self(theta_np)  # Objective is negative log-likelihood
+        loglik = -self(theta_np) / 2.0  # Objective is negative log-likelihood
         
         return mu, sigma, loglik
     
@@ -446,21 +488,46 @@ class MVNMLEObjective:
             
             # Extract relevant submatrices (R's approach)
             obs_indices = pattern.observed_indices
+            n_obs_vars = len(obs_indices)
             mu_k = mu[obs_indices]
             
-            # Compute Σₖ = (Δₖ⁻¹)ᵀ Δₖ⁻¹ for observed variables
+            # CRITICAL: Implement R's row shuffling algorithm exactly
+            # Create reordered Delta with observed rows first, missing rows last
             if is_torch:
-                Delta_k = Delta_stabilized[torch.ix_(obs_indices, obs_indices)]
+                subdel = torch.zeros((self.n_vars, self.n_vars), dtype=theta.dtype, device=theta.device)
             else:
-                Delta_k = Delta_stabilized[np.ix_(obs_indices, obs_indices)]
+                subdel = np.zeros((self.n_vars, self.n_vars))
+            
+            # Put observed variable rows first
+            pcount = 0
+            for i in range(self.n_vars):
+                if i in obs_indices:
+                    subdel[pcount, :] = Delta_stabilized[i, :]
+                    pcount += 1
+            
+            # Put missing variable rows last
+            acount = 0
+            for i in range(self.n_vars):
+                if i not in obs_indices:
+                    subdel[self.n_vars - acount - 1, :] = Delta_stabilized[i, :]
+                    acount += 1
+            
+            # Apply Givens rotations to the reordered matrix
+            subdel = self._apply_givens_rotations(subdel, array_lib)
+            
+            # Extract just the observed part (top-left submatrix)
+            if is_torch:
+                Delta_k = subdel[:n_obs_vars, :n_obs_vars]
+            else:
+                Delta_k = subdel[:n_obs_vars, :n_obs_vars]
             
             try:
                 # Use triangular solve for stability (R's method)
                 if is_torch:
-                    I_k = torch.eye(len(obs_indices), dtype=theta.dtype, device=theta.device)
+                    I_k = torch.eye(n_obs_vars, dtype=theta.dtype, device=theta.device)
                     Delta_k_inv = torch.linalg.solve(Delta_k, I_k)
                 else:
-                    I_k = np.eye(len(obs_indices))
+                    I_k = np.eye(n_obs_vars)
                     Delta_k_inv = np.linalg.solve(Delta_k, I_k)
                 
                 Sigma_k = Delta_k_inv.T @ Delta_k_inv
@@ -477,30 +544,27 @@ class MVNMLEObjective:
                 else:
                     data_k = pattern.data_k
                 
-                # Center the data
-                centered_data = data_k - mu_k  # Broadcasting over rows
+                # Center data by pattern mean
+                centered = data_k - mu_k
                 
-                # Quadratic form: tr((Y_k - μ_k) Σ_k^(-1) (Y_k - μ_k)^T)
+                # Compute quadratic form: sum_i (y_i - μ)' Σ^{-1} (y_i - μ)
                 if is_torch:
-                    Sigma_k_inv = torch.linalg.inv(Sigma_k)
-                    quad_form = torch.sum(torch.sum(centered_data * 
-                                        (centered_data @ Sigma_k_inv), dim=1))
+                    Sigma_k_inv = torch.linalg.solve(Sigma_k, I_k)
+                    quad_form = torch.sum(torch.sum(centered @ Sigma_k_inv * centered, dim=1))
                 else:
-                    Sigma_k_inv = np.linalg.inv(Sigma_k)
-                    quad_form = np.sum(np.sum(centered_data * 
-                                            (centered_data @ Sigma_k_inv), axis=1))
+                    Sigma_k_inv = np.linalg.solve(Sigma_k, I_k)
+                    quad_form = np.sum(np.sum(centered @ Sigma_k_inv * centered, axis=1))
                 
                 # Pattern contribution to negative log-likelihood
+                # -2 * loglik = n_k * log|Σ_k| + quadratic form
                 pattern_contrib = pattern.n_k * logdet_Sigma_k + quad_form
                 neg_loglik = neg_loglik + pattern_contrib
                 
-            except Exception:
-                # Numerical failure - return large penalty
+            except (np.linalg.LinAlgError, RuntimeError) as e:
+                # Handle numerical issues
                 if is_torch:
-                    penalty = torch.tensor(1e10, dtype=theta.dtype, device=theta.device)
+                    return torch.tensor(1e20, dtype=theta.dtype, device=theta.device)
                 else:
-                    penalty = 1e10
-                neg_loglik = neg_loglik + penalty
+                    return 1e20
         
-        # Return negative log-likelihood (R's convention)
-        return neg_loglik / 2.0
+        return neg_loglik

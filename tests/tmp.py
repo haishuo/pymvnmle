@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Quick test for missvals dataset convergence issue
-Run this to debug without waiting for full test suite
+Simple GPU acceleration test for PyMVNMLE
+Tests basic GPU backend functionality and reports errors
 """
 
 import numpy as np
 import sys
-import json
 from pathlib import Path
 
 # Add project root to path
@@ -14,93 +13,91 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pymvnmle import mlest, datasets
 
-def load_r_reference(filename):
-    """Load R reference results."""
-    ref_path = Path(__file__).parent / "references" / filename
-    with open(ref_path, 'r') as f:
-        return json.load(f)
-
-def test_missvals_debug():
-    """Debug test for missvals convergence issue."""
+def test_gpu_backend():
+    """Test basic GPU backend functionality."""
     print("=" * 60)
-    print("MISSVALS DATASET DEBUG TEST")
+    print("PyMVNMLE GPU ACCELERATION TEST")
     print("=" * 60)
     
-    # Load R reference
-    r_ref = load_r_reference('missvals_reference.json')
-    print(f"\nR Reference:")
-    print(f"  Log-likelihood: {r_ref['loglik']:.12f}")
-    print(f"  Iterations: {r_ref['iterations']}")
-    print(f"  Converged: {r_ref.get('converged', 'Unknown')}")
+    # Test data - use small apple dataset
+    data = datasets.apple
+    print(f"\nTest data: Apple dataset ({data.shape[0]} obs × {data.shape[1]} vars)")
+    print(f"Missing rate: {np.sum(np.isnan(data)) / data.size:.1%}")
     
-    # Test with method='auto' (what the failing test uses)
-    print(f"\nTest 1: method='auto' (failing case)")
-    print("-" * 40)
+    # Test 1: Try explicit GPU request
+    print("\n" + "-" * 50)
+    print("TEST 1: Explicit GPU request (backend='gpu')")
+    print("-" * 50)
     try:
-        result = mlest(datasets.missvals, method='auto', backend='auto', max_iter=400, verbose=False)
-        
-        print(f"\nResults:")
-        print(f"  Log-likelihood: {result.loglik:.12f}")
-        print(f"  R log-likelihood: {r_ref['loglik']:.12f}")
-        print(f"  Difference: {abs(result.loglik - r_ref['loglik']):.2e}")
-        print(f"  Converged: {result.converged}")
-        print(f"  Iterations: {result.n_iter}")
-        print(f"  Method used: {result.method}")
+        result = mlest(data, backend='gpu', verbose=True)
+        print(f"\n✅ SUCCESS! GPU backend worked")
         print(f"  Backend used: {result.backend}")
-        
-        if hasattr(result, 'gradient') and result.gradient is not None:
-            grad_norm = np.linalg.norm(result.gradient)
-            print(f"  Final gradient norm: {grad_norm:.2e}")
-        
-        # Check both conditions
-        loglik_pass = abs(result.loglik - r_ref['loglik']) < 1e-6
-        conv_pass = result.converged
-        
-        print(f"\n  Log-likelihood test: {'PASS' if loglik_pass else 'FAIL'}")
-        print(f"  Convergence test: {'PASS' if conv_pass else 'FAIL'}")
-        print(f"  Overall: {'PASS' if (loglik_pass and conv_pass) else 'FAIL'}")
-        
-    except Exception as e:
-        print(f"  FAILED WITH ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-    
-    # Test with method='BFGS' (should work)
-    print(f"\n\nTest 2: method='BFGS' (expected to work)")
-    print("-" * 40)
-    try:
-        result = mlest(datasets.missvals, method='BFGS', backend='auto', max_iter=400, verbose=False)
-        
-        print(f"Results:")
-        print(f"  Log-likelihood: {result.loglik:.12f}")
-        print(f"  Difference: {abs(result.loglik - r_ref['loglik']):.2e}")
+        print(f"  Method used: {result.method}")
+        print(f"  Log-likelihood: {result.loglik:.6f}")
         print(f"  Converged: {result.converged}")
-        print(f"  Iterations: {result.n_iter}")
-        
-        loglik_pass = abs(result.loglik - r_ref['loglik']) < 1e-6
-        conv_pass = result.converged
-        
-        print(f"\n  Log-likelihood test: {'PASS' if loglik_pass else 'FAIL'}")
-        print(f"  Convergence test: {'PASS' if conv_pass else 'FAIL'}")
-        print(f"  Overall: {'PASS' if (loglik_pass and conv_pass) else 'FAIL'}")
-        
     except Exception as e:
-        print(f"  FAILED WITH ERROR: {e}")
+        print(f"\n❌ FAILED with {type(e).__name__}: {e}")
     
-    # Quick test on Apple dataset to ensure we didn't break that
-    print(f"\n\nTest 3: Apple dataset sanity check")
-    print("-" * 40)
+    # Test 2: Try PyTorch backend directly
+    print("\n" + "-" * 50)
+    print("TEST 2: PyTorch backend (backend='pytorch')")
+    print("-" * 50)
     try:
-        result = mlest(datasets.apple, method='auto', verbose=False)
-        r_ref_apple = load_r_reference('apple_reference.json')
-        
-        loglik_diff = abs(result.loglik - r_ref_apple['loglik'])
-        print(f"  Log-likelihood difference: {loglik_diff:.2e}")
-        print(f"  Converged: {result.converged}")
-        print(f"  Result: {'PASS' if loglik_diff < 1e-7 else 'FAIL'}")
-        
+        result = mlest(data, backend='pytorch', verbose=True)
+        print(f"\n✅ SUCCESS! PyTorch backend worked")
+        print(f"  Backend used: {result.backend}")
+        print(f"  GPU accelerated: {result.gpu_accelerated}")
     except Exception as e:
-        print(f"  FAILED WITH ERROR: {e}")
+        print(f"\n❌ FAILED with {type(e).__name__}: {e}")
+    
+    # Test 3: Try JAX backend
+    print("\n" + "-" * 50)
+    print("TEST 3: JAX backend (backend='jax')")
+    print("-" * 50)
+    try:
+        result = mlest(data, backend='jax', verbose=True)
+        print(f"\n✅ SUCCESS! JAX backend worked")
+        print(f"  Backend used: {result.backend}")
+    except Exception as e:
+        print(f"\n❌ FAILED with {type(e).__name__}: {e}")
+    
+    # Test 4: Check what backends are available
+    print("\n" + "-" * 50)
+    print("TEST 4: Available backends check")
+    print("-" * 50)
+    try:
+        from pymvnmle._backends import get_available_backends
+        available = get_available_backends()
+        print(f"Available backends: {available}")
+        
+        # Try to import GPU backends directly
+        print("\nDirect import tests:")
+        
+        try:
+            import torch
+            print(f"  ✓ PyTorch {torch.__version__} available")
+            if torch.cuda.is_available():
+                print(f"    - CUDA available: {torch.cuda.get_device_name(0)}")
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                print(f"    - Metal/MPS available")
+            else:
+                print(f"    - No GPU acceleration available in PyTorch")
+        except ImportError:
+            print("  ✗ PyTorch not installed")
+        
+        try:
+            import jax
+            print(f"  ✓ JAX {jax.__version__} available")
+            print(f"    - Devices: {jax.devices()}")
+        except ImportError:
+            print("  ✗ JAX not installed")
+            
+    except Exception as e:
+        print(f"Failed to check backends: {e}")
+    
+    print("\n" + "=" * 60)
+    print("GPU TEST COMPLETE")
+    print("=" * 60)
 
 if __name__ == "__main__":
-    test_missvals_debug()
+    test_gpu_backend()

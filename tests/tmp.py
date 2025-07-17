@@ -1,102 +1,106 @@
 #!/usr/bin/env python3
 """
-Test that the fixed get_initial_parameters() resolves the Missvals issue
+Quick test for missvals dataset convergence issue
+Run this to debug without waiting for full test suite
 """
 
 import numpy as np
-from pymvnmle import mlest
-from pymvnmle.datasets import missvals
+import sys
+import json
+from pathlib import Path
 
-print("Testing Fixed Implementation with Pairwise Complete Covariance")
-print("="*60)
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# R reference values
-r_loglik = -86.978324
-test_incorrect_value = -40.453229  # The incorrect value in the test
+from pymvnmle import mlest, datasets
 
-print("Reference values:")
-print(f"  Correct R log-likelihood: {r_loglik:.6f}")
-print(f"  Incorrect test value: {test_incorrect_value:.6f}")
+def load_r_reference(filename):
+    """Load R reference results."""
+    ref_path = Path(__file__).parent / "references" / filename
+    with open(ref_path, 'r') as f:
+        return json.load(f)
 
-# Run with the fixed implementation
-print("\nRunning PyMVNMLE with fixed starting values...")
-result = mlest(missvals, method='BFGS', max_iter=400, verbose=False)
-
-print(f"\nResults:")
-print(f"  Log-likelihood: {result.loglik:.6f}")
-print(f"  Converged: {result.converged}")
-print(f"  Iterations: {result.n_iter}")
-
-# Compare with references
-diff_from_r = abs(result.loglik - r_loglik)
-diff_from_test = abs(result.loglik - test_incorrect_value) 
-
-print(f"\nDifferences:")
-print(f"  From correct R value: {diff_from_r:.6f}")
-print(f"  From test value: {diff_from_test:.6f}")
-
-# Check if we're closer to R now
-print("\n" + "="*60)
-if diff_from_r < 10:  # Within reasonable tolerance
-    print("✅ SUCCESS! The fix brings us much closer to R's result!")
-    print(f"   Remaining difference: {diff_from_r:.6f}")
-    if diff_from_r < 1:
-        print("   This is within acceptable numerical tolerance!")
-    else:
-        print("   Some difference remains, but it's much better than before.")
-else:
-    print("⚠️  Still have significant difference from R.")
-    print("   May need additional investigation.")
-
-# Test the starting values directly
-print("\n" + "="*60)
-print("Checking Starting Covariance Structure:")
-print("="*60)
-
-from pymvnmle._objective import MVNMLEObjective
-from pymvnmle._backends import get_backend_with_fallback
-
-backend = get_backend_with_fallback('numpy', verbose=False)
-obj = MVNMLEObjective(missvals, backend=backend)
-theta0 = obj.get_initial_parameters()
-
-# Extract the Delta matrix to check correlations
-n_vars = missvals.shape[1]
-log_diag = theta0[n_vars:2*n_vars]
-Delta = np.diag(np.exp(log_diag))
-
-# Fill in off-diagonals
-idx = 2 * n_vars
-for j in range(1, n_vars):
-    for i in range(j):
-        Delta[i, j] = theta0[idx]
-        idx += 1
-
-print("Starting Delta matrix has non-zero off-diagonals:")
-print(f"  Delta[0,1] = {Delta[0, 1]:.6f}")
-print(f"  Delta[2,4] = {Delta[2, 4]:.6f} (critical for sparse pattern)")
-
-# Compute implied starting covariance
-try:
-    Delta_inv = np.linalg.inv(Delta)
-    Sigma_start = Delta_inv.T @ Delta_inv
+def test_missvals_debug():
+    """Debug test for missvals convergence issue."""
+    print("=" * 60)
+    print("MISSVALS DATASET DEBUG TEST")
+    print("=" * 60)
     
-    print("\nImplied starting covariance for variables 3,5:")
-    print(f"  Var(V3) = {Sigma_start[2, 2]:.3f}")
-    print(f"  Var(V5) = {Sigma_start[4, 4]:.3f}")
-    print(f"  Cov(V3,V5) = {Sigma_start[2, 4]:.3f}")
-    print(f"  Correlation = {Sigma_start[2, 4] / np.sqrt(Sigma_start[2, 2] * Sigma_start[4, 4]):.3f}")
+    # Load R reference
+    r_ref = load_r_reference('missvals_reference.json')
+    print(f"\nR Reference:")
+    print(f"  Log-likelihood: {r_ref['loglik']:.12f}")
+    print(f"  Iterations: {r_ref['iterations']}")
+    print(f"  Converged: {r_ref.get('converged', 'Unknown')}")
     
-    if abs(Sigma_start[2, 4]) > 10:
-        print("\n✅ Starting values now capture the negative correlation!")
-except:
-    print("\n⚠️  Could not compute starting covariance")
+    # Test with method='auto' (what the failing test uses)
+    print(f"\nTest 1: method='auto' (failing case)")
+    print("-" * 40)
+    try:
+        result = mlest(datasets.missvals, method='auto', backend='auto', max_iter=400, verbose=False)
+        
+        print(f"\nResults:")
+        print(f"  Log-likelihood: {result.loglik:.12f}")
+        print(f"  R log-likelihood: {r_ref['loglik']:.12f}")
+        print(f"  Difference: {abs(result.loglik - r_ref['loglik']):.2e}")
+        print(f"  Converged: {result.converged}")
+        print(f"  Iterations: {result.n_iter}")
+        print(f"  Method used: {result.method}")
+        print(f"  Backend used: {result.backend}")
+        
+        if hasattr(result, 'gradient') and result.gradient is not None:
+            grad_norm = np.linalg.norm(result.gradient)
+            print(f"  Final gradient norm: {grad_norm:.2e}")
+        
+        # Check both conditions
+        loglik_pass = abs(result.loglik - r_ref['loglik']) < 1e-6
+        conv_pass = result.converged
+        
+        print(f"\n  Log-likelihood test: {'PASS' if loglik_pass else 'FAIL'}")
+        print(f"  Convergence test: {'PASS' if conv_pass else 'FAIL'}")
+        print(f"  Overall: {'PASS' if (loglik_pass and conv_pass) else 'FAIL'}")
+        
+    except Exception as e:
+        print(f"  FAILED WITH ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Test with method='BFGS' (should work)
+    print(f"\n\nTest 2: method='BFGS' (expected to work)")
+    print("-" * 40)
+    try:
+        result = mlest(datasets.missvals, method='BFGS', backend='auto', max_iter=400, verbose=False)
+        
+        print(f"Results:")
+        print(f"  Log-likelihood: {result.loglik:.12f}")
+        print(f"  Difference: {abs(result.loglik - r_ref['loglik']):.2e}")
+        print(f"  Converged: {result.converged}")
+        print(f"  Iterations: {result.n_iter}")
+        
+        loglik_pass = abs(result.loglik - r_ref['loglik']) < 1e-6
+        conv_pass = result.converged
+        
+        print(f"\n  Log-likelihood test: {'PASS' if loglik_pass else 'FAIL'}")
+        print(f"  Convergence test: {'PASS' if conv_pass else 'FAIL'}")
+        print(f"  Overall: {'PASS' if (loglik_pass and conv_pass) else 'FAIL'}")
+        
+    except Exception as e:
+        print(f"  FAILED WITH ERROR: {e}")
+    
+    # Quick test on Apple dataset to ensure we didn't break that
+    print(f"\n\nTest 3: Apple dataset sanity check")
+    print("-" * 40)
+    try:
+        result = mlest(datasets.apple, method='auto', verbose=False)
+        r_ref_apple = load_r_reference('apple_reference.json')
+        
+        loglik_diff = abs(result.loglik - r_ref_apple['loglik'])
+        print(f"  Log-likelihood difference: {loglik_diff:.2e}")
+        print(f"  Converged: {result.converged}")
+        print(f"  Result: {'PASS' if loglik_diff < 1e-7 else 'FAIL'}")
+        
+    except Exception as e:
+        print(f"  FAILED WITH ERROR: {e}")
 
-print("\n" + "="*60)
-print("SUMMARY:")
-print("="*60)
-print("The fixed get_initial_parameters() should now:")
-print("1. Compute pairwise complete covariances")
-print("2. Capture the V3-V5 correlation")
-print("3. Lead to better optimization results")
-print("4. Match or get very close to R's reference value")
+if __name__ == "__main__":
+    test_missvals_debug()

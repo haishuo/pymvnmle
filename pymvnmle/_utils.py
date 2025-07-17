@@ -344,3 +344,110 @@ def format_result(opt_result: OptimizeResult,
         'gradient': getattr(opt_result, 'jac', None),
         'hessian': getattr(opt_result, 'hess', None)
     }
+
+def select_backend_and_method(backend, method, n_obs, n_vars, verbose):
+    """
+    Select and validate backend and optimization method.
+    NO DEFAULTS - all parameters must be explicitly passed.
+    
+    Returns
+    -------
+    tuple : (selected_backend, selected_method, backend_obj)
+        - selected_backend: str, actual backend name that will be used
+        - selected_method: str, actual method name that will be used  
+        - backend_obj: BackendInterface, instantiated backend object
+    """
+    import warnings
+    from ._backends import get_backend_with_fallback
+    
+    # =================================================================
+    # BACKEND SELECTION - auto means CPU
+    # =================================================================
+    
+    # Normalize backend request
+    backend_lower = backend.lower() if backend else 'auto'
+    
+    if backend_lower == 'auto':
+        # Auto ALWAYS means CPU
+        selected_backend = 'numpy'
+        is_gpu = False
+    elif backend_lower in ['cpu', 'numpy']:
+        selected_backend = 'numpy'
+        is_gpu = False
+    elif backend_lower in ['gpu', 'cuda', 'metal', 'mps', 'pytorch', 'torch']:
+        # GPU requested - try PyTorch
+        selected_backend = 'pytorch'
+        is_gpu = True
+    elif backend_lower == 'jax':
+        selected_backend = 'jax'
+        is_gpu = True
+    else:
+        raise ValueError(
+            f"Unknown backend '{backend}'. "
+            f"Use 'auto' (CPU), 'gpu', 'pytorch', or 'jax'."
+        )
+    
+    # Get backend instance
+    try:
+        backend_obj = get_backend_with_fallback(
+            selected_backend,
+            data_shape=(n_obs, n_vars),
+            verbose=verbose
+        )
+        # Check if we actually got what we requested
+        if backend_obj.name != selected_backend:
+            # Fallback occurred
+            if is_gpu:
+                warnings.warn(
+                    f"GPU backend '{selected_backend}' not available, using CPU"
+                )
+            selected_backend = backend_obj.name
+            is_gpu = False  # We fell back to CPU
+    except Exception as e:
+        if verbose:
+            print(f"⚠️ Backend '{selected_backend}' failed: {e}")
+        # Fall back to CPU
+        backend_obj = get_backend_with_fallback('numpy', verbose=verbose)
+        selected_backend = 'numpy'
+        is_gpu = False
+    
+    # =================================================================
+    # METHOD SELECTION - depends on backend
+    # =================================================================
+    
+    # Normalize method
+    method_upper = method.upper() if method else 'BFGS'
+    
+    if is_gpu:
+        # GPU backend - ONLY Newton-CG allowed
+        if method_upper != 'NEWTON-CG':
+            if verbose or method_upper != 'BFGS':  # Warn unless it's the default
+                warnings.warn(
+                    f"GPU backend requires Newton-CG method. "
+                    f"Ignoring requested method '{method}'."
+                )
+        selected_method = 'Newton-CG'
+    else:
+        # CPU backend - validate against allowed methods
+        cpu_methods = ['BFGS', 'L-BFGS-B', 'NELDER-MEAD', 'POWELL']
+        
+        if method_upper == 'NEWTON-CG':
+            raise ValueError(
+                "Newton-CG requires GPU backend with autodiff. "
+                "Use backend='gpu' or select a different method: "
+                f"{', '.join(cpu_methods)}"
+            )
+        elif method_upper in cpu_methods:
+            # Valid CPU method - use original case
+            selected_method = method if method else 'BFGS'
+        else:
+            raise ValueError(
+                f"Invalid method '{method}' for CPU backend. "
+                f"Valid methods: {', '.join(cpu_methods)}"
+            )
+    
+    if verbose:
+        print(f"Backend requested: {backend} -> selected: {selected_backend}")
+        print(f"Method requested: {method} -> selected: {selected_method}")
+    
+    return selected_backend, selected_method, backend_obj

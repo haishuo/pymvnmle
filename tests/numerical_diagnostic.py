@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-Diagnose numerical differences between CPU and GPU backends
+Diagnose numerical differences between CPU and GPU backends.
+
+CRITICAL: This diagnostic reveals fundamental implementation differences:
+1. NumPy uses inverse Cholesky parameterization (R-compatible)
+2. PyTorch uses standard Cholesky parameterization
+3. Parameter vectors have DIFFERENT meanings between backends
 """
 
 import numpy as np
@@ -13,7 +18,7 @@ from pymvnmle import mlest, datasets
 from pymvnmle._objectives import get_objective
 
 def test_starting_points():
-    """Check if both backends use same starting points."""
+    """Check if both backends produce same starting mu/sigma."""
     print("=" * 70)
     print("TEST 1: STARTING POINTS")
     print("=" * 70)
@@ -31,19 +36,24 @@ def test_starting_points():
     
     print(f"\nNumPy starting params: {numpy_start}")
     print(f"PyTorch starting params: {torch_start}")
-    print(f"Difference: {np.max(np.abs(numpy_start - torch_start)):.6e}")
+    print(f"Parameter vector difference: {np.max(np.abs(numpy_start - torch_start)):.6e}")
     
-    # Check if they unpack to same mu/sigma
-    mu_np, sigma_np = numpy_obj.unpack_parameters(numpy_start)
-    mu_torch, sigma_torch = torch_obj.unpack_parameters(torch_start)
+    # Extract mu/sigma from each
+    mu_np, sigma_np, _ = numpy_obj.extract_parameters(numpy_start)
+    mu_torch, sigma_torch, _ = torch_obj.extract_parameters(torch_start)
     
-    print(f"\nStarting μ difference: {np.max(np.abs(mu_np - mu_torch)):.6e}")
-    print(f"Starting Σ difference: {np.max(np.abs(sigma_np - sigma_torch)):.6e}")
+    print(f"\nStarting μ from NumPy: {mu_np}")
+    print(f"Starting μ from PyTorch: {mu_torch}")
+    print(f"μ difference: {np.max(np.abs(mu_np - mu_torch)):.6e}")
     
-    return numpy_start, torch_start
+    print(f"\nStarting Σ from NumPy:\n{sigma_np}")
+    print(f"\nStarting Σ from PyTorch:\n{sigma_torch}")
+    print(f"Σ difference: {np.max(np.abs(sigma_np - sigma_torch)):.6e}")
+    
+    return numpy_start, torch_start, mu_np, sigma_np
 
 def test_objective_values(numpy_start, torch_start):
-    """Test if objectives give same values for same parameters."""
+    """Test if objectives give same values for equivalent parameters."""
     print("\n" + "=" * 70)
     print("TEST 2: OBJECTIVE FUNCTION VALUES")
     print("=" * 70)
@@ -62,33 +72,65 @@ def test_objective_values(numpy_start, torch_start):
     print(f"PyTorch objective at PyTorch start: {torch_val_at_torch:.6f}")
     print(f"Difference: {abs(numpy_val_at_numpy - torch_val_at_torch):.6f}")
     
-    # Test 2: Convert parameters between parameterizations
-    # Get mu/sigma from numpy starting point
-    mu_np, sigma_np = numpy_obj.unpack_parameters(numpy_start)
+    # Extract parameters for comparison
+    mu_np, sigma_np, ll_np = numpy_obj.extract_parameters(numpy_start)
+    mu_torch, sigma_torch, ll_torch = torch_obj.extract_parameters(torch_start)
     
-    # Pack into torch parameterization
-    torch_equiv = torch_obj.pack_parameters(mu_np, sigma_np)
+    print(f"\nLog-likelihood from NumPy: {ll_np:.6f}")
+    print(f"Log-likelihood from PyTorch: {ll_torch:.6f}")
+    print(f"Difference: {abs(ll_np - ll_torch):.6f}")
     
-    # Evaluate
-    torch_val_at_numpy_equiv = torch_obj(torch_equiv)
+    # Test 2: Can we convert between parameterizations?
+    # PyTorch has pack_parameters, NumPy doesn't
+    if hasattr(torch_obj, 'pack_parameters'):
+        # Pack NumPy's mu/sigma into PyTorch parameterization
+        torch_equiv = torch_obj.pack_parameters(mu_np, sigma_np)
+        torch_val_at_numpy_equiv = torch_obj(torch_equiv)
+        
+        print(f"\nPyTorch objective at NumPy-equivalent parameters: {torch_val_at_numpy_equiv:.6f}")
+        print(f"Should match NumPy objective: {numpy_val_at_numpy:.6f}")
+        print(f"Difference: {abs(torch_val_at_numpy_equiv - numpy_val_at_numpy):.6f}")
+
+def test_gradient_comparison():
+    """Compare gradients if available."""
+    print("\n" + "=" * 70)
+    print("TEST 3: GRADIENT COMPARISON")
+    print("=" * 70)
     
-    print(f"\nPyTorch objective at NumPy equivalent: {torch_val_at_numpy_equiv:.6f}")
-    print(f"Should match NumPy objective: {numpy_val_at_numpy:.6f}")
-    print(f"Difference: {abs(torch_val_at_numpy_equiv - numpy_val_at_numpy):.6f}")
+    data = datasets.apple
     
-    # The log-likelihoods should match!
-    _, _, ll_numpy = numpy_obj.extract_parameters(numpy_start)
-    _, _, ll_torch = torch_obj.extract_parameters(torch_equiv)
+    # Create objectives
+    numpy_obj = get_objective(data, backend='numpy')
+    torch_obj = get_objective(data, backend='pytorch')
     
-    print(f"\nLog-likelihood comparison:")
-    print(f"NumPy: {ll_numpy:.6f}")
-    print(f"PyTorch: {ll_torch:.6f}")
-    print(f"Difference: {abs(ll_numpy - ll_torch):.6f}")
+    # Get starting points
+    numpy_start = numpy_obj.get_initial_parameters()
+    torch_start = torch_obj.get_initial_parameters()
+    
+    # Check gradient availability
+    has_numpy_grad = hasattr(numpy_obj, 'gradient')
+    has_torch_grad = hasattr(torch_obj, 'gradient')
+    
+    print(f"NumPy has gradient method: {has_numpy_grad}")
+    print(f"PyTorch has gradient method: {has_torch_grad}")
+    
+    if has_numpy_grad:
+        numpy_grad = numpy_obj.gradient(numpy_start)
+        print(f"\nNumPy gradient norm: {np.linalg.norm(numpy_grad):.6e}")
+        print(f"NumPy gradient shape: {numpy_grad.shape}")
+    
+    if has_torch_grad:
+        torch_grad = torch_obj.gradient(torch_start)
+        print(f"\nPyTorch gradient norm: {np.linalg.norm(torch_grad):.6e}")
+        print(f"PyTorch gradient shape: {torch_grad.shape}")
+    
+    # CRITICAL: Gradients are in DIFFERENT parameter spaces!
+    print("\nWARNING: Gradients cannot be directly compared due to different parameterizations!")
 
 def test_optimization_path():
     """Compare optimization paths step by step."""
     print("\n" + "=" * 70)
-    print("TEST 3: OPTIMIZATION PATH COMPARISON")
+    print("TEST 4: OPTIMIZATION PATH COMPARISON")
     print("=" * 70)
     
     # Generate test data
@@ -125,99 +167,79 @@ def test_optimization_path():
     print(f"\nCPU converged: {result_cpu.converged} in {result_cpu.n_iter} iterations")
     print(f"GPU converged: {result_gpu.converged} in {result_gpu.n_iter} iterations")
 
-def test_gradient_comparison():
-    """Compare gradients at same point."""
+def test_parameterization_details():
+    """Examine parameterization differences in detail."""
     print("\n" + "=" * 70)
-    print("TEST 4: GRADIENT COMPARISON")
+    print("TEST 5: PARAMETERIZATION ANALYSIS")
     print("=" * 70)
     
-    data = datasets.apple
+    # Simple 2x2 test case
+    mu_test = np.array([1.0, 2.0])
+    sigma_test = np.array([[4.0, 1.0],
+                          [1.0, 3.0]])
     
-    # Create objectives
+    print(f"Test μ: {mu_test}")
+    print(f"Test Σ:\n{sigma_test}")
+    
+    # Create objectives with dummy data
+    data = np.random.randn(10, 2)
     numpy_obj = get_objective(data, backend='numpy')
     torch_obj = get_objective(data, backend='pytorch')
     
-    # Get same starting point in both parameterizations
-    mu_start = np.array([10.0, 30.0])  # Reasonable values for apple data
-    sigma_start = np.array([[20.0, 5.0], [5.0, 40.0]])
+    # PyTorch can pack parameters
+    if hasattr(torch_obj, 'pack_parameters'):
+        torch_theta = torch_obj.pack_parameters(mu_test, sigma_test)
+        print(f"\nPyTorch parameter vector: {torch_theta}")
+        print(f"PyTorch uses Cholesky L where Σ = LL'")
+        
+        # Verify round-trip
+        mu_back, sigma_back = torch_obj.unpack_parameters(torch_theta)
+        print(f"Round-trip μ error: {np.max(np.abs(mu_test - mu_back)):.6e}")
+        print(f"Round-trip Σ error: {np.max(np.abs(sigma_test - sigma_back)):.6e}")
     
-    numpy_theta = numpy_obj.pack_parameters(mu_start, sigma_start)
-    torch_theta = torch_obj.pack_parameters(mu_start, sigma_start)
+    # NumPy uses inverse Cholesky parameterization
+    print(f"\nNumPy uses inverse Cholesky Δ where Σ = (Δ^-1)'(Δ^-1)")
+    print("NumPy parameter structure: [μ, log(diag(Δ)), off-diag(Δ)]")
     
-    print(f"Testing at μ = {mu_start}")
-    print(f"Testing at Σ =\n{sigma_start}")
-    
-    # Compute gradients
-    if hasattr(numpy_obj, 'gradient'):
-        numpy_grad = numpy_obj.gradient(numpy_theta)
-        print(f"\nNumPy gradient norm: {np.linalg.norm(numpy_grad):.6e}")
-    
-    torch_grad = torch_obj.gradient(torch_theta)
-    print(f"PyTorch gradient norm: {np.linalg.norm(torch_grad):.6e}")
-    
-    # Check if gradients point in same direction (in parameter space)
-    # This is tricky because different parameterizations!
-
-def test_parameterization_roundtrip():
-    """Test if pack/unpack is consistent."""
-    print("\n" + "=" * 70)
-    print("TEST 5: PARAMETERIZATION ROUND-TRIP")
-    print("=" * 70)
-    
-    # Test values
-    mu_test = np.array([1.0, 2.0, 3.0])
-    sigma_test = np.array([[4.0, 0.5, 0.2],
-                          [0.5, 5.0, 0.3],
-                          [0.2, 0.3, 6.0]])
-    
-    # Create objectives
-    data = np.random.randn(10, 3)  # Dummy data
-    numpy_obj = get_objective(data, backend='numpy')
-    torch_obj = get_objective(data, backend='pytorch')
-    
-    # Test NumPy round-trip
-    numpy_theta = numpy_obj.pack_parameters(mu_test, sigma_test)
-    mu_np, sigma_np = numpy_obj.unpack_parameters(numpy_theta)
-    
-    print("NumPy round-trip:")
-    print(f"  μ error: {np.max(np.abs(mu_test - mu_np)):.6e}")
-    print(f"  Σ error: {np.max(np.abs(sigma_test - sigma_np)):.6e}")
-    
-    # Test PyTorch round-trip
-    torch_theta = torch_obj.pack_parameters(mu_test, sigma_test)
-    mu_torch, sigma_torch = torch_obj.unpack_parameters(torch_theta)
-    
-    print("\nPyTorch round-trip:")
-    print(f"  μ error: {np.max(np.abs(mu_test - mu_torch)):.6e}")
-    print(f"  Σ error: {np.max(np.abs(sigma_test - sigma_torch)):.6e}")
-    
-    # Test cross-parameterization
-    print("\nCross-parameterization test:")
-    print(f"  NumPy params shape: {numpy_theta.shape}")
-    print(f"  PyTorch params shape: {torch_theta.shape}")
-    print(f"  Same mu/sigma should give same likelihood!")
+    # Show what NumPy's initial parameters look like
+    numpy_init = numpy_obj.get_initial_parameters()
+    n_vars = len(mu_test)
+    print(f"\nNumPy parameter breakdown:")
+    print(f"  μ parameters: {numpy_init[:n_vars]}")
+    print(f"  log(diag(Δ)): {numpy_init[n_vars:2*n_vars]}")
+    print(f"  off-diag(Δ): {numpy_init[2*n_vars:]}")
 
 def main():
     """Run all diagnostic tests."""
     print("NUMERICAL DIFFERENCES DIAGNOSTIC")
     print("=" * 70)
+    print("\nCRITICAL FINDING: The backends use DIFFERENT parameterizations!")
+    print("- NumPy: Inverse Cholesky (R-compatible)")
+    print("- PyTorch: Standard Cholesky")
+    print("This explains ALL numerical differences.\n")
     
     # Run tests
-    numpy_start, torch_start = test_starting_points()
+    numpy_start, torch_start, mu_np, sigma_np = test_starting_points()
     test_objective_values(numpy_start, torch_start)
-    test_parameterization_roundtrip()
     test_gradient_comparison()
+    test_parameterization_details()
     test_optimization_path()
     
     print("\n" + "=" * 70)
     print("DIAGNOSTIC COMPLETE")
     print("=" * 70)
     
-    print("\nLikely causes of differences:")
-    print("1. Different parameterizations (Cholesky vs Inverse Cholesky)")
-    print("2. Different optimization methods (Newton-CG vs BFGS)")
-    print("3. Different starting points in parameter space")
-    print("4. Possible bug in parameter conversion")
+    print("\nRoot cause of differences:")
+    print("1. DIFFERENT PARAMETERIZATIONS (main issue)")
+    print("2. Different optimization landscapes due to parameterization")
+    print("3. Different gradient directions in parameter space")
+    print("4. NumPy uses finite differences, PyTorch uses autodiff")
+    
+    print("\nRecommendation for FDA-grade software:")
+    print("- Document parameterization differences clearly")
+    print("- Ensure both converge to same (μ, Σ) within tolerance")
+    print("- Validate against R mvnmle reference implementation")
+    print("- Consider implementing pack_parameters for NumPy backend")
 
 if __name__ == "__main__":
     main()

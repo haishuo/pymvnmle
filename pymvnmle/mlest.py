@@ -24,7 +24,7 @@ except ImportError:
     raise ImportError("SciPy is required for optimization. Install with: pip install scipy")
 
 from ._utils import validate_input_data, format_result, check_convergence, select_backend_and_method
-from ._objective import MVNMLEObjective
+from ._objectives import get_objective  # Changed from ._objective import MVNMLEObjective
 from ._backends import get_backend_with_fallback
 
 
@@ -235,7 +235,8 @@ def mlest(data: Union[np.ndarray, pd.DataFrame],
         print("Creating objective function (using R's exact algorithm)...")
     
     try:
-        obj = MVNMLEObjective(data_array, backend=backend_obj)
+        # Changed: Use get_objective from _objectives folder
+        obj = get_objective(data_array, backend=selected_backend)
         start_vals = obj.get_initial_parameters()
     except Exception as e:
         raise RuntimeError(f"Failed to create objective function: {e}")

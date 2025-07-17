@@ -1,103 +1,116 @@
-#!/usr/bin/env python3
 """
-Simple GPU acceleration test for PyMVNMLE
-Tests basic GPU backend functionality and reports errors
+Test what actually matters: Do we get the same statistical results?
 """
 
 import numpy as np
-import sys
-from pathlib import Path
+from scipy.optimize import minimize
+from pymvnmle._objectives import get_objective
+from pymvnmle import datasets
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Test on a real dataset
+print("🧪 Testing Statistical Equivalence: CPU vs GPU")
+print("=" * 60)
 
-from pymvnmle import mlest, datasets
+# Use the apple dataset (small but real)
+data = datasets.apple
+n_obs, n_vars = data.shape
+n_params = n_vars + (n_vars * (n_vars + 1)) // 2
 
-def test_gpu_backend():
-    """Test basic GPU backend functionality."""
-    print("=" * 60)
-    print("PyMVNMLE GPU ACCELERATION TEST")
-    print("=" * 60)
-    
-    # Test data - use small apple dataset
-    data = datasets.apple
-    print(f"\nTest data: Apple dataset ({data.shape[0]} obs × {data.shape[1]} vars)")
-    print(f"Missing rate: {np.sum(np.isnan(data)) / data.size:.1%}")
-    
-    # Test 1: Try explicit GPU request
-    print("\n" + "-" * 50)
-    print("TEST 1: Explicit GPU request (backend='gpu')")
-    print("-" * 50)
-    try:
-        result = mlest(data, backend='gpu', verbose=True)
-        print(f"\n✅ SUCCESS! GPU backend worked")
-        print(f"  Backend used: {result.backend}")
-        print(f"  Method used: {result.method}")
-        print(f"  Log-likelihood: {result.loglik:.6f}")
-        print(f"  Converged: {result.converged}")
-    except Exception as e:
-        print(f"\n❌ FAILED with {type(e).__name__}: {e}")
-    
-    # Test 2: Try PyTorch backend directly
-    print("\n" + "-" * 50)
-    print("TEST 2: PyTorch backend (backend='pytorch')")
-    print("-" * 50)
-    try:
-        result = mlest(data, backend='pytorch', verbose=True)
-        print(f"\n✅ SUCCESS! PyTorch backend worked")
-        print(f"  Backend used: {result.backend}")
-        print(f"  GPU accelerated: {result.gpu_accelerated}")
-    except Exception as e:
-        print(f"\n❌ FAILED with {type(e).__name__}: {e}")
-    
-    # Test 3: Try JAX backend
-    print("\n" + "-" * 50)
-    print("TEST 3: JAX backend (backend='jax')")
-    print("-" * 50)
-    try:
-        result = mlest(data, backend='jax', verbose=True)
-        print(f"\n✅ SUCCESS! JAX backend worked")
-        print(f"  Backend used: {result.backend}")
-    except Exception as e:
-        print(f"\n❌ FAILED with {type(e).__name__}: {e}")
-    
-    # Test 4: Check what backends are available
-    print("\n" + "-" * 50)
-    print("TEST 4: Available backends check")
-    print("-" * 50)
-    try:
-        from pymvnmle._backends import get_available_backends
-        available = get_available_backends()
-        print(f"Available backends: {available}")
-        
-        # Try to import GPU backends directly
-        print("\nDirect import tests:")
-        
-        try:
-            import torch
-            print(f"  ✓ PyTorch {torch.__version__} available")
-            if torch.cuda.is_available():
-                print(f"    - CUDA available: {torch.cuda.get_device_name(0)}")
-            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                print(f"    - Metal/MPS available")
-            else:
-                print(f"    - No GPU acceleration available in PyTorch")
-        except ImportError:
-            print("  ✗ PyTorch not installed")
-        
-        try:
-            import jax
-            print(f"  ✓ JAX {jax.__version__} available")
-            print(f"    - Devices: {jax.devices()}")
-        except ImportError:
-            print("  ✗ JAX not installed")
-            
-    except Exception as e:
-        print(f"Failed to check backends: {e}")
-    
-    print("\n" + "=" * 60)
-    print("GPU TEST COMPLETE")
-    print("=" * 60)
+print(f"\n📊 Dataset: Apple ({n_obs} observations, {n_vars} variables)")
+print(f"Parameters to estimate: {n_params}")
 
-if __name__ == "__main__":
-    test_gpu_backend()
+# Create objectives
+numpy_obj = get_objective(data, backend='numpy')
+torch_obj = get_objective(data, backend='pytorch')
+
+# Starting values (same for both)
+np.random.seed(42)
+theta0 = np.random.randn(n_params)
+
+print(f"\n🎯 Starting objective values:")
+print(f"NumPy: {numpy_obj(theta0):.6f}")
+print(f"PyTorch: {torch_obj(theta0):.6f}")
+
+# Optimize with NumPy backend
+print(f"\n⚙️ Optimizing with NumPy backend...")
+result_numpy = minimize(
+    numpy_obj,
+    theta0,
+    method='BFGS',
+    options={'maxiter': 1000, 'gtol': 1e-6}
+)
+print(f"Converged: {result_numpy.success} in {result_numpy.nit} iterations")
+print(f"Final objective: {result_numpy.fun:.6f}")
+
+# Extract estimates
+mu_numpy, sigma_numpy, loglik_numpy = numpy_obj.extract_parameters(result_numpy.x)
+print(f"\nNumPy estimates:")
+print(f"μ = {mu_numpy}")
+print(f"Σ = \n{sigma_numpy}")
+
+# Optimize with PyTorch backend using autodiff gradients
+print(f"\n⚙️ Optimizing with PyTorch backend (autodiff gradients)...")
+
+def torch_obj_with_grad(theta):
+    """Objective and gradient for scipy."""
+    obj_val = torch_obj(theta)
+    grad = torch_obj.gradient(theta)
+    return obj_val, grad
+
+result_torch = minimize(
+    torch_obj_with_grad,
+    theta0,
+    method='BFGS',
+    jac=True,  # We're providing gradients
+    options={'maxiter': 1000, 'gtol': 1e-6}
+)
+print(f"Converged: {result_torch.success} in {result_torch.nit} iterations")
+print(f"Final objective: {result_torch.fun:.6f}")
+
+# Extract estimates
+mu_torch, sigma_torch, loglik_torch = torch_obj.extract_parameters(result_torch.x)
+print(f"\nPyTorch estimates:")
+print(f"μ = {mu_torch}")
+print(f"Σ = \n{sigma_torch}")
+
+# Compare results
+print(f"\n📈 STATISTICAL COMPARISON:")
+print(f"-" * 40)
+
+# Mean comparison
+mu_diff = np.max(np.abs(mu_numpy - mu_torch))
+mu_rel_diff = mu_diff / (np.max(np.abs(mu_numpy)) + 1e-10)
+print(f"Mean difference: {mu_diff:.6f} (relative: {mu_rel_diff:.2%})")
+
+# Covariance comparison
+sigma_diff = np.max(np.abs(sigma_numpy - sigma_torch))
+sigma_rel_diff = sigma_diff / (np.max(np.abs(sigma_numpy)) + 1e-10)
+print(f"Covariance difference: {sigma_diff:.6f} (relative: {sigma_rel_diff:.2%})")
+
+# Log-likelihood comparison
+loglik_diff = abs(loglik_numpy - loglik_torch)
+print(f"Log-likelihood difference: {loglik_diff:.6f}")
+
+# Statistical significance test
+# If estimates are within 0.1% relative error, they're statistically equivalent
+tolerance = 0.001  # 0.1%
+
+if mu_rel_diff < tolerance and sigma_rel_diff < tolerance:
+    print(f"\n✅ SUCCESS: Estimates are statistically equivalent!")
+    print(f"   Both methods converged to the same solution.")
+    print(f"   Autodiff gradients are working correctly for optimization!")
+else:
+    print(f"\n❌ FAILURE: Estimates differ significantly.")
+    print(f"   This indicates a problem with the gradient computation.")
+
+# Performance comparison
+print(f"\n⏱️ PERFORMANCE:")
+print(f"NumPy iterations: {result_numpy.nit}")
+print(f"PyTorch iterations: {result_torch.nit}")
+
+if result_torch.nit < result_numpy.nit:
+    print(f"🚀 PyTorch converged {result_numpy.nit - result_torch.nit} iterations faster!")
+elif result_torch.nit > result_numpy.nit:
+    print(f"🐌 PyTorch took {result_torch.nit - result_numpy.nit} more iterations.")
+else:
+    print(f"🤝 Both methods took the same number of iterations.")

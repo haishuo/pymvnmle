@@ -1,164 +1,191 @@
+#!/usr/bin/env python3
 """
-Test if PyTorch gradients lead to convergence with proper optimization.
+PyMVNMLE Large Dataset GPU Performance Test
+n=1000, p=20 - Where CPU chokes but GPU shines!
+RTX 5070 Ti should handle this like a champ
 """
 
 import numpy as np
-from scipy.optimize import minimize
-from pymvnmle._objectives import get_objective
-from pymvnmle import datasets
+import time
+import sys
+from pathlib import Path
 
-# Test function that uses line search
-def test_gradient_descent_with_line_search():
-    """Test if gradients are valid descent directions with appropriate step size."""
-    
-    print("🧪 Testing PyTorch Gradient Descent with Line Search")
-    print("=" * 60)
-    
-    # Use apple dataset
-    data = datasets.apple
-    
-    # Create objectives
-    numpy_obj = get_objective(data, backend='numpy')
-    torch_obj = get_objective(data, backend='pytorch')
-    
-    # Starting point
-    np.random.seed(42)
-    n_vars = data.shape[1]
-    n_params = n_vars + (n_vars * (n_vars + 1)) // 2
-    theta = np.random.randn(n_params)
-    
-    print(f"Starting objective: {numpy_obj(theta):.6f}")
-    
-    # Test gradient descent with line search
-    print("\n📉 Gradient descent test (5 iterations):")
-    
-    for i in range(5):
-        # Get gradient
-        grad = torch_obj.gradient(theta)
-        grad_norm = np.linalg.norm(grad)
-        
-        # Line search to find appropriate step size
-        obj_current = numpy_obj(theta)
-        
-        # Try different step sizes
-        for alpha in [1e-6, 1e-5, 1e-4, 1e-3, 1e-2]:
-            theta_new = theta - alpha * grad
-            obj_new = numpy_obj(theta_new)
-            
-            if np.isfinite(obj_new) and obj_new < obj_current:
-                theta = theta_new
-                print(f"  Iter {i+1}: obj = {obj_new:.6f}, ||grad|| = {grad_norm:.2e}, step = {alpha:.0e}")
-                break
-        else:
-            print(f"  Iter {i+1}: No valid step found, stopping")
-            break
-    
-    print("\n" + "="*60)
-    
-    # Now test full optimization
-    print("\n🎯 Full Optimization Test")
-    print("="*60)
-    
-    # Reset starting point
-    theta0 = np.random.randn(n_params) * 0.1  # Smaller initial values
-    
-    # Add bounds to prevent numerical issues
-    bounds = []
-    for i in range(n_params):
-        if i < n_vars:
-            # Mean parameters: unbounded
-            bounds.append((None, None))
-        elif i < 2 * n_vars:
-            # Log-diagonal parameters: keep reasonable
-            bounds.append((-10, 10))
-        else:
-            # Off-diagonal parameters: keep reasonable
-            bounds.append((-50, 50))
-    
-    print("🔹 NumPy optimization:")
-    result_numpy = minimize(
-        numpy_obj,
-        theta0,
-        method='L-BFGS-B',
-        bounds=bounds,
-        options={'maxiter': 200, 'ftol': 1e-8}
-    )
-    print(f"  Converged: {result_numpy.success}")
-    print(f"  Iterations: {result_numpy.nit}")
-    print(f"  Final objective: {result_numpy.fun:.6f}")
-    
-    # Extract estimates
-    mu_np, sigma_np, loglik_np = numpy_obj.extract_parameters(result_numpy.x)
-    
-    print("\n🔹 PyTorch optimization (with autodiff):")
-    
-    def torch_obj_and_grad(theta):
-        """Combined objective and gradient for L-BFGS-B."""
-        obj = torch_obj(theta)
-        grad = torch_obj.gradient(theta)
-        return obj, grad
-    
-    result_torch = minimize(
-        torch_obj_and_grad,
-        theta0,
-        method='L-BFGS-B',
-        jac=True,
-        bounds=bounds,
-        options={'maxiter': 200, 'ftol': 1e-8}
-    )
-    print(f"  Converged: {result_torch.success}")
-    print(f"  Iterations: {result_torch.nit}")
-    print(f"  Final objective: {result_torch.fun:.6f}")
-    
-    # Extract estimates
-    mu_torch, sigma_torch, loglik_torch = torch_obj.extract_parameters(result_torch.x)
-    
-    # Compare results
-    print("\n📊 RESULTS COMPARISON:")
-    print("-" * 40)
-    
-    print("\nMean estimates:")
-    print(f"  NumPy:   {mu_np}")
-    print(f"  PyTorch: {mu_torch}")
-    print(f"  Max diff: {np.max(np.abs(mu_np - mu_torch)):.6f}")
-    
-    print("\nCovariance estimates:")
-    print(f"  NumPy diagonal:   {np.diag(sigma_np)}")
-    print(f"  PyTorch diagonal: {np.diag(sigma_torch)}")
-    print(f"  Max diff: {np.max(np.abs(sigma_np - sigma_torch)):.6f}")
-    
-    print("\nLog-likelihood:")
-    print(f"  NumPy:   {loglik_np:.6f}")
-    print(f"  PyTorch: {loglik_torch:.6f}")
-    print(f"  Diff: {abs(loglik_np - loglik_torch):.6f}")
-    
-    # Statistical equivalence test
-    mu_rel_err = np.max(np.abs(mu_np - mu_torch)) / (np.max(np.abs(mu_np)) + 1e-10)
-    sigma_rel_err = np.max(np.abs(sigma_np - sigma_torch)) / (np.max(np.abs(sigma_np)) + 1e-10)
-    
-    print(f"\n📈 Relative errors:")
-    print(f"  Mean: {mu_rel_err:.2%}")
-    print(f"  Covariance: {sigma_rel_err:.2%}")
-    
-    if mu_rel_err < 0.01 and sigma_rel_err < 0.01:
-        print("\n✅ SUCCESS! Estimates are statistically equivalent (< 1% difference)")
-        print("   PyTorch autodiff gradients work for optimization!")
-        
-        # Performance comparison
-        if result_torch.nit < result_numpy.nit:
-            print(f"\n🚀 BONUS: PyTorch converged {result_numpy.nit - result_torch.nit} iterations faster!")
-        
-        return True
-    else:
-        print("\n❌ Estimates differ by more than 1%")
-        return False
-
-# Run the test
+# Add project root to path if running as script
 if __name__ == "__main__":
-    success = test_gradient_descent_with_line_search()
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
+try:
+    from pymvnmle import mlest
+    PYMVNMLE_AVAILABLE = True
+except ImportError:
+    PYMVNMLE_AVAILABLE = False
+    print("WARNING: PyMVNMLE not found in Python path")
+
+def generate_large_test_data(n=1000, p=20, missing_rate=0.15, seed=42):
+    """Generate large test data that will stress CPU but not GPU."""
+    np.random.seed(seed)
     
-    if success:
-        print("\n🎉 PyTorch autodiff implementation is working correctly!")
-        print("   We have achieved analytical gradients for MLE with missing data!")
-    else:
-        print("\n🔧 More work needed on the gradient computation...")
+    # Generate multivariate normal data with some correlation structure
+    # Make it more realistic with a structured covariance
+    A = np.random.randn(p, p)
+    cov = A @ A.T  # Ensure positive definite
+    cov = cov / np.max(np.abs(cov)) * 2  # Scale it reasonably
+    
+    data = np.random.multivariate_normal(np.zeros(p), cov, n)
+    
+    # Add missingness
+    missing_mask = np.random.random(data.shape) < missing_rate
+    data[missing_mask] = np.nan
+    
+    # Report stats
+    n_missing = np.sum(missing_mask)
+    total_values = n * p
+    actual_missing_rate = n_missing / total_values
+    
+    print(f"Generated data: {n} observations × {p} variables")
+    print(f"Missing values: {n_missing:,}/{total_values:,} ({actual_missing_rate:.1%})")
+    print(f"Number of parameters to estimate: {p + p*(p+1)//2}")
+    
+    # Estimate number of patterns (rough)
+    unique_patterns = len(np.unique(missing_mask.astype(int) @ (2**np.arange(p)), return_counts=True)[0])
+    print(f"Estimated missingness patterns: ~{unique_patterns}")
+    
+    return data
+
+def test_large_gpu_performance():
+    """Test GPU vs CPU performance on large dataset."""
+    print("=" * 70)
+    print("PyMVNMLE LARGE DATASET GPU TEST")
+    print("n=1000, p=20 - The CPU Killer!")
+    print("Running on: NVIDIA GeForce RTX 5070 Ti")
+    print("=" * 70)
+    
+    if not PYMVNMLE_AVAILABLE:
+        print("\n❌ ERROR: PyMVNMLE not installed or not in path")
+        return
+    
+    # Generate large test data
+    print("\nGenerating large test data...")
+    data = generate_large_test_data(n=1000, p=20, missing_rate=0.15)
+    
+    # Test GPU backend FIRST (since CPU might take forever)
+    print("\n" + "-" * 50)
+    print("GPU BACKEND TEST (RTX 5070 Ti)")
+    print("-" * 50)
+    
+    try:
+        start_time = time.time()
+        result_gpu = mlest(data, backend='gpu', verbose=True, max_iter=1000)
+        gpu_time = time.time() - start_time
+        
+        print(f"\n✅ GPU Success!")
+        print(f"  Time: {gpu_time:.3f} seconds")
+        print(f"  Converged: {result_gpu.converged}")
+        print(f"  Iterations: {result_gpu.n_iter}")
+        print(f"  Log-likelihood: {result_gpu.loglik:.6f}")
+        print(f"  Backend used: {result_gpu.backend}")
+        
+        if gpu_time < 10:
+            print(f"\n🚀 GPU handled this large problem in under 10 seconds!")
+        elif gpu_time < 30:
+            print(f"\n✨ GPU solved this in reasonable time!")
+        
+    except Exception as e:
+        print(f"\n❌ GPU Failed: {type(e).__name__}: {e}")
+        gpu_time = None
+        result_gpu = None
+    
+    # Test CPU backend (with timeout warning)
+    print("\n" + "-" * 50)
+    print("CPU BACKEND TEST")
+    print("-" * 50)
+    print("⚠️  WARNING: This might take a VERY long time...")
+    print("    (n=1000, p=20 means 230 parameters with finite differences)")
+    print("    Press Ctrl+C to skip if it's taking too long")
+    
+    try:
+        start_time = time.time()
+        
+        # Add a progress indicator
+        print("\nStarting CPU optimization...")
+        result_cpu = mlest(data, backend='cpu', verbose=True, max_iter=200)  # Lower max_iter
+        cpu_time = time.time() - start_time
+        
+        print(f"\n✅ CPU Success!")
+        print(f"  Time: {cpu_time:.3f} seconds")
+        print(f"  Converged: {result_cpu.converged}")
+        print(f"  Iterations: {result_cpu.n_iter}")
+        print(f"  Log-likelihood: {result_cpu.loglik:.6f}")
+        
+    except KeyboardInterrupt:
+        print("\n⏹️  CPU test interrupted by user")
+        cpu_time = time.time() - start_time
+        print(f"  Time before interruption: {cpu_time:.1f} seconds")
+        cpu_time = None
+        result_cpu = None
+    except Exception as e:
+        print(f"\n❌ CPU Failed: {type(e).__name__}: {e}")
+        cpu_time = None
+        result_cpu = None
+    
+    # Performance comparison
+    print("\n" + "=" * 70)
+    print("PERFORMANCE SUMMARY")
+    print("=" * 70)
+    
+    print(f"\nProblem size: n=1000 × p=20 (230 parameters)")
+    print(f"Missing data: ~15%")
+    
+    if gpu_time is not None:
+        print(f"\nGPU Time (RTX 5070 Ti): {gpu_time:.3f} seconds")
+        
+        if gpu_time < 5:
+            print("🏆 BLAZING FAST! Under 5 seconds for this large problem!")
+        elif gpu_time < 10:
+            print("🚀 Excellent! Under 10 seconds!")
+        elif gpu_time < 30:
+            print("✨ Good performance for this problem size")
+    
+    if cpu_time is not None and gpu_time is not None:
+        speedup = cpu_time / gpu_time
+        print(f"\nCPU Time: {cpu_time:.3f} seconds")
+        print(f"\n💥 GPU SPEEDUP: {speedup:.1f}x faster!")
+        
+        if speedup > 50:
+            print("🤯 OVER 50X SPEEDUP! The GPU is crushing it!")
+        elif speedup > 20:
+            print("🔥 Massive speedup! This is why we need GPUs!")
+    elif cpu_time is None and gpu_time is not None:
+        print(f"\nCPU: Did not complete (too slow)")
+        print(f"💀 CPU CHOKED on this problem size!")
+        print(f"🚀 GPU completed in {gpu_time:.1f}s while CPU couldn't finish!")
+    
+    # Show why GPU is so much better
+    if result_gpu is not None:
+        print("\n" + "-" * 50)
+        print("WHY GPU DOMINATES:")
+        print("-" * 50)
+        print(f"1. Analytical gradients: Only {result_gpu.n_iter} iterations needed")
+        print(f"2. Parallel tensor ops: RTX 5070 Ti tensor cores")
+        print(f"3. No finite difference overhead: Direct gradient computation")
+        print(f"4. Memory bandwidth: GPU can handle large matrices efficiently")
+    
+    # Numerical equivalence check (if both completed)
+    if result_cpu is not None and result_gpu is not None:
+        print("\n" + "-" * 50)
+        print("NUMERICAL EQUIVALENCE CHECK")
+        print("-" * 50)
+        
+        mu_diff = np.max(np.abs(result_cpu.muhat - result_gpu.muhat))
+        sigma_diff = np.max(np.abs(result_cpu.sigmahat - result_gpu.sigmahat))
+        ll_diff = abs(result_cpu.loglik - result_gpu.loglik)
+        
+        print(f"Max μ difference: {mu_diff:.2e}")
+        print(f"Max Σ difference: {sigma_diff:.2e}")
+        print(f"Log-likelihood difference: {ll_diff:.2e}")
+        
+        if mu_diff < 1e-6 and sigma_diff < 1e-6:
+            print("\n✅ Results are statistically equivalent!")
+
+if __name__ == "__main__":
+    test_large_gpu_performance()

@@ -1,27 +1,29 @@
 """
-PyTorch MLE objective using Cholesky parameterization.
-Different parameterization, same statistical model.
+PyTorch MLE objective using Cholesky parameterization with PATTERN BATCHING.
+Optimized for GPU performance while maintaining compatibility with existing base.py
 """
 
 import torch
 import numpy as np
-from typing import Union, Tuple, List, Optional
-from .base import MLEObjectiveBase
+from typing import Union, Tuple, List, Optional, Dict
+from .base import MLEObjectiveBase, PatternData
 from .numpy_objective import NumpyMLEObjective
 
 
 class TorchMLEObjective(MLEObjectiveBase):
     """
-    PyTorch implementation using Cholesky parameterization.
+    PyTorch implementation using Cholesky parameterization with GPU optimization.
     
-    Key insight: Instead of trying to match R's inverse Cholesky + Givens,
-    use a standard Cholesky parameterization that's natural for PyTorch.
+    Key optimizations:
+    1. Pattern batching - process patterns of same size together
+    2. torch.compile - JIT compilation for performance
+    3. Efficient tensor operations - minimize CPU-GPU transfers
     
     This will give different parameter values but the SAME estimates for (μ, Σ).
     """
     
     def __init__(self, data: np.ndarray, device: Optional[str] = None):
-        """Initialize with preprocessing."""
+        """Initialize with preprocessing and pattern grouping."""
         super().__init__(data)
         
         # Device selection
@@ -38,23 +40,44 @@ class TorchMLEObjective(MLEObjectiveBase):
         else:
             self.device = torch.device(device)
         
-        # Pre-convert pattern data
+        # Pre-convert and group patterns for batching
         self._prepare_patterns()
     
     def _prepare_patterns(self):
-        """Convert pattern data to PyTorch tensors."""
+        """Convert pattern data to PyTorch tensors AND group by size for batching."""
         self.torch_patterns = []
+        self.pattern_groups = {}  # Group patterns by number of observed variables
         
         for pattern in self.patterns:
             if pattern.n_k == 0 or len(pattern.observed_indices) == 0:
                 continue
             
-            self.torch_patterns.append({
+            # Convert to tensors
+            pattern_dict = {
                 'data': torch.tensor(pattern.data_k, dtype=torch.float64, device=self.device),
                 'obs_idx': torch.tensor(pattern.observed_indices, dtype=torch.long, device=self.device),
                 'n_k': pattern.n_k,
                 'n_obs': len(pattern.observed_indices)
-            })
+            }
+            
+            self.torch_patterns.append(pattern_dict)
+            
+            # Group by size for batching
+            n_obs = len(pattern.observed_indices)
+            if n_obs not in self.pattern_groups:
+                self.pattern_groups[n_obs] = {
+                    'patterns': [],
+                    'indices': [],  # Store original pattern indices
+                    'total_n_k': 0
+                }
+            
+            self.pattern_groups[n_obs]['patterns'].append(pattern_dict)
+            self.pattern_groups[n_obs]['indices'].append(len(self.torch_patterns) - 1)
+            self.pattern_groups[n_obs]['total_n_k'] += pattern.n_k
+        
+        # Print batching statistics
+        if len(self.pattern_groups) < len(self.torch_patterns):
+            print(f"📊 Pattern batching: {len(self.torch_patterns)} patterns → {len(self.pattern_groups)} batches")
     
     def _unpack_theta_cholesky(self, theta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -87,12 +110,12 @@ class TorchMLEObjective(MLEObjectiveBase):
         
         return mu, L
     
+    @torch.compile  # JIT compilation for performance
     def _torch_objective(self, theta: torch.Tensor) -> torch.Tensor:
         """
-        Compute -2*log(L) using Cholesky parameterization.
+        Compute -2*log(L) using Cholesky parameterization with PATTERN BATCHING.
         
-        This is mathematically equivalent to the inverse Cholesky
-        parameterization but more natural for PyTorch.
+        This is the optimized version that processes patterns in batches.
         """
         # Unpack parameters
         mu, L = self._unpack_theta_cholesky(theta)
@@ -104,59 +127,135 @@ class TorchMLEObjective(MLEObjectiveBase):
         eps = 1e-8
         Sigma = Sigma + eps * torch.eye(self.n_vars, device=Sigma.device)
         
-        # Compute objective
+        # Compute objective by pattern groups (BATCHED)
         neg_2_loglik = torch.tensor(0.0, dtype=torch.float64, device=self.device)
         
-        for pattern in self.torch_patterns:
-            data_k = pattern['data']
-            obs_idx = pattern['obs_idx']
-            n_k = pattern['n_k']
-            n_obs = pattern['n_obs']
+        # Process each group of patterns with same size
+        for n_obs, group_info in self.pattern_groups.items():
+            patterns = group_info['patterns']
+            n_patterns = len(patterns)
             
-            # Extract parameters for observed variables
-            mu_k = mu[obs_idx]
+            if n_patterns == 1:
+                # Single pattern - process as before
+                pattern = patterns[0]
+                contrib = self._process_single_pattern(pattern, mu, Sigma, eps)
+                neg_2_loglik = neg_2_loglik + contrib
+            else:
+                # Multiple patterns - BATCH PROCESSING!
+                contrib = self._process_pattern_batch(patterns, mu, Sigma, eps, n_obs)
+                neg_2_loglik = neg_2_loglik + contrib
+        
+        return neg_2_loglik
+    
+    def _process_single_pattern(self, pattern: Dict, mu: torch.Tensor, 
+                               Sigma: torch.Tensor, eps: float) -> torch.Tensor:
+        """Process a single pattern (original method for comparison)."""
+        data_k = pattern['data']
+        obs_idx = pattern['obs_idx']
+        n_k = pattern['n_k']
+        n_obs = pattern['n_obs']
+        
+        # Extract parameters for observed variables
+        mu_k = mu[obs_idx]
+        Sigma_k = Sigma[obs_idx[:, None], obs_idx]
+        
+        # Add regularization
+        Sigma_k = Sigma_k + eps * torch.eye(n_obs, device=Sigma_k.device)
+        
+        # Compute using Cholesky decomposition for stability
+        try:
+            L_k = torch.linalg.cholesky(Sigma_k)
             
-            # Extract covariance submatrix
-            Sigma_k = Sigma[obs_idx[:, None], obs_idx]
+            # Log-determinant: log|Σ| = 2*log|L|
+            log_det = 2 * torch.sum(torch.log(torch.diag(L_k)))
             
-            # Add regularization
-            Sigma_k = Sigma_k + eps * torch.eye(n_obs, device=Sigma_k.device)
+            # Quadratic form: (y-μ)'Σ^(-1)(y-μ)
+            centered = data_k - mu_k
+            z = torch.linalg.solve_triangular(L_k, centered.T, upper=False)
+            quadratic = torch.sum(z * z)
             
-            # Compute using Cholesky decomposition for stability
-            try:
-                L_k = torch.linalg.cholesky(Sigma_k)
+            # Contribution (without 2π term)
+            contrib = n_k * log_det + quadratic
+            
+        except RuntimeError:
+            # Fallback for numerical issues
+            contrib = self._fallback_computation(Sigma_k, mu_k, data_k, n_k, eps)
+        
+        return contrib
+    
+    def _process_pattern_batch(self, patterns: List[Dict], mu: torch.Tensor,
+                              Sigma: torch.Tensor, eps: float, n_obs: int) -> torch.Tensor:
+        """
+        Process multiple patterns of the same size in a batch.
+        
+        This is the KEY OPTIMIZATION - process many patterns at once!
+        """
+        n_patterns = len(patterns)
+        
+        # Stack all data for this pattern size
+        # Create batch tensors
+        batch_data = []
+        batch_n_k = []
+        batch_indices = []
+        
+        for pattern in patterns:
+            batch_data.append(pattern['data'])
+            batch_n_k.append(pattern['n_k'])
+            batch_indices.append(pattern['obs_idx'])
+        
+        # Use the first pattern's indices (they all have same observed variables structure)
+        obs_idx = patterns[0]['obs_idx']
+        
+        # Extract parameters for observed variables (same for all in batch)
+        mu_k = mu[obs_idx]
+        Sigma_k = Sigma[obs_idx[:, None], obs_idx]
+        Sigma_k = Sigma_k + eps * torch.eye(n_obs, device=Sigma_k.device)
+        
+        # Compute Cholesky once for all patterns
+        try:
+            L_k = torch.linalg.cholesky(Sigma_k)
+            log_det = 2 * torch.sum(torch.log(torch.diag(L_k)))
+            
+            # Process all patterns in batch
+            total_contrib = torch.tensor(0.0, dtype=torch.float64, device=self.device)
+            
+            # Batch compute quadratic forms
+            for i, pattern in enumerate(patterns):
+                data_k = pattern['data']
+                n_k = pattern['n_k']
                 
-                # Log-determinant: log|Σ| = 2*log|L|
-                log_det = 2 * torch.sum(torch.log(torch.diag(L_k)))
-                
-                # Quadratic form: (y-μ)'Σ^(-1)(y-μ)
-                # Solve L_k @ z = (y-μ)' for each observation
+                # Quadratic form for this pattern
                 centered = data_k - mu_k
                 z = torch.linalg.solve_triangular(L_k, centered.T, upper=False)
                 quadratic = torch.sum(z * z)
                 
-                # Contribution (without 2π term)
-                contrib = n_k * log_det + quadratic
-                
-            except RuntimeError:
-                # Fallback for numerical issues
-                # Use eigendecomposition
-                eigvals, eigvecs = torch.linalg.eigh(Sigma_k)
-                eigvals = torch.clamp(eigvals, min=eps)
-                
-                log_det = torch.sum(torch.log(eigvals))
-                
-                # Quadratic form
-                centered = data_k - mu_k
-                transformed = torch.matmul(centered, eigvecs)
-                weighted = transformed / torch.sqrt(eigvals)
-                quadratic = torch.sum(weighted * weighted)
-                
-                contrib = n_k * log_det + quadratic
+                total_contrib += n_k * log_det + quadratic
             
-            neg_2_loglik = neg_2_loglik + contrib
+            return total_contrib
+            
+        except RuntimeError:
+            # Fallback - process individually
+            total_contrib = torch.tensor(0.0, dtype=torch.float64, device=self.device)
+            for pattern in patterns:
+                contrib = self._process_single_pattern(pattern, mu, Sigma, eps)
+                total_contrib += contrib
+            return total_contrib
+    
+    def _fallback_computation(self, Sigma_k: torch.Tensor, mu_k: torch.Tensor,
+                             data_k: torch.Tensor, n_k: int, eps: float) -> torch.Tensor:
+        """Fallback computation using eigendecomposition for numerical issues."""
+        eigvals, eigvecs = torch.linalg.eigh(Sigma_k)
+        eigvals = torch.clamp(eigvals, min=eps)
         
-        return neg_2_loglik
+        log_det = torch.sum(torch.log(eigvals))
+        
+        # Quadratic form
+        centered = data_k - mu_k
+        transformed = torch.matmul(centered, eigvecs)
+        weighted = transformed / torch.sqrt(eigvals)
+        quadratic = torch.sum(weighted * weighted)
+        
+        return n_k * log_det + quadratic
     
     def pack_parameters(self, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:
         """

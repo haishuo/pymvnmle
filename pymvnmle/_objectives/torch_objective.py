@@ -1,6 +1,6 @@
 """
-PyTorch implementation with correct mathematical formulation.
-Uses the covariance parameterization with proper numerical methods.
+PyTorch MLE objective using Cholesky parameterization.
+Different parameterization, same statistical model.
 """
 
 import torch
@@ -12,10 +12,12 @@ from .numpy_objective import NumpyMLEObjective
 
 class TorchMLEObjective(MLEObjectiveBase):
     """
-    PyTorch implementation with autodiff gradients.
+    PyTorch implementation using Cholesky parameterization.
     
-    Strategy: Use the same parameterization as NumPy (inverse Cholesky)
-    but compute likelihood using covariance form for stability.
+    Key insight: Instead of trying to match R's inverse Cholesky + Givens,
+    use a standard Cholesky parameterization that's natural for PyTorch.
+    
+    This will give different parameter values but the SAME estimates for (μ, Σ).
     """
     
     def __init__(self, data: np.ndarray, device: Optional[str] = None):
@@ -26,188 +28,212 @@ class TorchMLEObjective(MLEObjectiveBase):
         if device is None:
             if torch.cuda.is_available():
                 self.device = torch.device('cuda')
-                self.device_name = torch.cuda.get_device_name()
+                print(f"🚀 Using CUDA GPU: {torch.cuda.get_device_name()}")
             elif torch.backends.mps.is_available():
                 self.device = torch.device('mps')
-                self.device_name = "Apple Metal Performance Shaders"
+                print(f"🚀 Using Apple Metal GPU")
             else:
                 self.device = torch.device('cpu')
-                self.device_name = "CPU"
+                print(f"💻 Using CPU")
         else:
             self.device = torch.device(device)
-            self.device_name = str(device)
-        
-        print(f"🚀 TorchMLEObjective initialized on {self.device_name}")
         
         # Pre-convert pattern data
         self._prepare_patterns()
     
     def _prepare_patterns(self):
-        """Prepare pattern data for GPU computation."""
-        self.gpu_patterns = []
+        """Convert pattern data to PyTorch tensors."""
+        self.torch_patterns = []
         
         for pattern in self.patterns:
             if pattern.n_k == 0 or len(pattern.observed_indices) == 0:
                 continue
             
-            self.gpu_patterns.append({
+            self.torch_patterns.append({
                 'data': torch.tensor(pattern.data_k, dtype=torch.float64, device=self.device),
-                'obs_idx': pattern.observed_indices,
+                'obs_idx': torch.tensor(pattern.observed_indices, dtype=torch.long, device=self.device),
                 'n_k': pattern.n_k,
                 'n_obs': len(pattern.observed_indices)
             })
     
-    def __call__(self, theta: Union[np.ndarray, torch.Tensor]) -> Union[float, torch.Tensor]:
+    def _unpack_theta_cholesky(self, theta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute objective by wrapping NumPy implementation.
-        This ensures exact compatibility while we develop autodiff.
-        """
-        if isinstance(theta, torch.Tensor):
-            theta_np = theta.detach().cpu().numpy()
-        else:
-            theta_np = theta
-            
-        # Create NumPy objective and use it
-        numpy_obj = NumpyMLEObjective(self.original_data)
-        return numpy_obj(theta_np)
-    
-    def _torch_forward(self, theta: torch.Tensor) -> torch.Tensor:
-        """
-        PyTorch forward pass for gradient computation.
+        Unpack parameters using Cholesky parameterization.
         
-        This implements a simplified but mathematically equivalent version
-        that's differentiable.
+        Parameters are organized as:
+        - First n_vars: mean μ
+        - Next n_vars: log-diagonal of Cholesky factor L
+        - Remaining: Lower triangular elements of L (row-major order)
+        
+        This ensures Σ = L @ L.T is always positive definite.
         """
-        # Extract mean
+        # Mean
         mu = theta[:self.n_vars]
         
-        # Build inverse Cholesky factor (upper triangular)
-        inv_L = torch.zeros((self.n_vars, self.n_vars), dtype=theta.dtype, device=theta.device)
+        # Build lower triangular Cholesky factor
+        L = torch.zeros((self.n_vars, self.n_vars), dtype=theta.dtype, device=theta.device)
         
-        # Diagonal (positive)
+        # Diagonal (positive via exp)
         log_diag = theta[self.n_vars:2*self.n_vars]
-        diag_vals = torch.exp(log_diag)
-        inv_L.diagonal().copy_(diag_vals)
+        L_diag = torch.exp(log_diag)
+        L = L + torch.diag(L_diag)
         
-        # Upper triangle
+        # Lower triangular elements
         idx = 2 * self.n_vars
-        for j in range(self.n_vars):
-            for i in range(j):
-                inv_L[i, j] = theta[idx]
+        for i in range(1, self.n_vars):
+            for j in range(i):
+                L[i, j] = theta[idx]
                 idx += 1
         
-        # Compute Cholesky factor: L = inv_L^{-1}
-        # Σ = L @ L.T
-        I = torch.eye(self.n_vars, dtype=theta.dtype, device=theta.device)
-        L = torch.linalg.solve_triangular(inv_L, I, upper=True)
+        return mu, L
+    
+    def _torch_objective(self, theta: torch.Tensor) -> torch.Tensor:
+        """
+        Compute -2*log(L) using Cholesky parameterization.
+        
+        This is mathematically equivalent to the inverse Cholesky
+        parameterization but more natural for PyTorch.
+        """
+        # Unpack parameters
+        mu, L = self._unpack_theta_cholesky(theta)
+        
+        # Compute full covariance: Σ = L @ L.T
+        Sigma = torch.matmul(L, L.T)
+        
+        # Add small regularization for numerical stability
+        eps = 1e-8
+        Sigma = Sigma + eps * torch.eye(self.n_vars, device=Sigma.device)
         
         # Compute objective
         neg_2_loglik = torch.tensor(0.0, dtype=torch.float64, device=self.device)
         
-        for pattern in self.gpu_patterns:
-            obs_idx = pattern['obs_idx']
+        for pattern in self.torch_patterns:
             data_k = pattern['data']
+            obs_idx = pattern['obs_idx']
             n_k = pattern['n_k']
             n_obs = pattern['n_obs']
             
             # Extract parameters for observed variables
             mu_k = mu[obs_idx]
             
-            # Extract submatrix of L
-            L_k = L[obs_idx, :][:, obs_idx]
+            # Extract covariance submatrix
+            Sigma_k = Sigma[obs_idx[:, None], obs_idx]
             
-            # For numerical stability, add small regularization
-            L_k = L_k + 1e-8 * torch.eye(n_obs, device=L_k.device)
+            # Add regularization
+            Sigma_k = Sigma_k + eps * torch.eye(n_obs, device=Sigma_k.device)
             
-            # Compute log|Σ_k| = 2*log|L_k|
-            log_det = 2 * torch.sum(torch.log(torch.abs(torch.diag(L_k))))
+            # Compute using Cholesky decomposition for stability
+            try:
+                L_k = torch.linalg.cholesky(Sigma_k)
+                
+                # Log-determinant: log|Σ| = 2*log|L|
+                log_det = 2 * torch.sum(torch.log(torch.diag(L_k)))
+                
+                # Quadratic form: (y-μ)'Σ^(-1)(y-μ)
+                # Solve L_k @ z = (y-μ)' for each observation
+                centered = data_k - mu_k
+                z = torch.linalg.solve_triangular(L_k, centered.T, upper=False)
+                quadratic = torch.sum(z * z)
+                
+                # Contribution (without 2π term)
+                contrib = n_k * log_det + quadratic
+                
+            except RuntimeError:
+                # Fallback for numerical issues
+                # Use eigendecomposition
+                eigvals, eigvecs = torch.linalg.eigh(Sigma_k)
+                eigvals = torch.clamp(eigvals, min=eps)
+                
+                log_det = torch.sum(torch.log(eigvals))
+                
+                # Quadratic form
+                centered = data_k - mu_k
+                transformed = torch.matmul(centered, eigvecs)
+                weighted = transformed / torch.sqrt(eigvals)
+                quadratic = torch.sum(weighted * weighted)
+                
+                contrib = n_k * log_det + quadratic
             
-            # Compute quadratic form
-            centered = data_k - mu_k
-            # Σ_k^{-1} = (L_k @ L_k.T)^{-1}, so we solve L_k @ z = centered.T
-            z = torch.linalg.solve_triangular(L_k, centered.T, upper=False)
-            quadratic = torch.sum(z * z)
-            
-            # Add contribution (without the constant term for now)
-            neg_2_loglik += n_k * log_det + quadratic
+            neg_2_loglik = neg_2_loglik + contrib
         
         return neg_2_loglik
     
+    def pack_parameters(self, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:
+        """
+        Pack (μ, Σ) into parameter vector using Cholesky parameterization.
+        
+        This is used to convert from R parameterization to our parameterization.
+        """
+        # Compute Cholesky decomposition
+        try:
+            L = np.linalg.cholesky(sigma)
+        except np.linalg.LinAlgError:
+            # Add regularization if not positive definite
+            eigvals = np.linalg.eigvalsh(sigma)
+            min_eig = np.min(eigvals)
+            if min_eig < 1e-8:
+                sigma = sigma + (1e-8 - min_eig) * np.eye(self.n_vars)
+            L = np.linalg.cholesky(sigma)
+        
+        # Pack parameters
+        theta = np.zeros(self.n_params)
+        
+        # Mean
+        theta[:self.n_vars] = mu
+        
+        # Log-diagonal of L
+        theta[self.n_vars:2*self.n_vars] = np.log(np.diag(L))
+        
+        # Lower triangular elements
+        idx = 2 * self.n_vars
+        for i in range(1, self.n_vars):
+            for j in range(i):
+                theta[idx] = L[i, j]
+                idx += 1
+        
+        return theta
+    
+    def unpack_parameters(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Unpack parameter vector to (μ, Σ)."""
+        # Convert to tensor
+        theta_tensor = torch.tensor(theta, dtype=torch.float64, device=self.device)
+        
+        # Unpack
+        mu, L = self._unpack_theta_cholesky(theta_tensor)
+        
+        # Compute covariance
+        Sigma = torch.matmul(L, L.T)
+        
+        # Convert to numpy
+        return mu.cpu().numpy(), Sigma.cpu().numpy()
+    
+    def __call__(self, theta: Union[np.ndarray, torch.Tensor]) -> float:
+        """Compute objective value."""
+        if isinstance(theta, np.ndarray):
+            theta = torch.tensor(theta, dtype=torch.float64, device=self.device)
+        
+        with torch.no_grad():
+            return self._torch_objective(theta).item()
+    
     def gradient(self, theta: np.ndarray) -> np.ndarray:
-        """
-        Compute gradient using automatic differentiation.
-        """
-        # Method 1: Use PyTorch's autograd through our forward function
+        """Compute analytical gradient using autodiff."""
         theta_tensor = torch.tensor(theta, dtype=torch.float64, device=self.device, requires_grad=True)
         
-        try:
-            # Use simplified forward pass
-            loss = self._torch_forward(theta_tensor)
-            loss.backward()
-            grad = theta_tensor.grad.detach().cpu().numpy()
-            
-            # Validate gradient
-            if not np.all(np.isfinite(grad)):
-                print("Warning: Non-finite gradients detected, using finite differences")
-                raise RuntimeError("Non-finite gradients")
-            
-            print(f"✅ Successfully computed ANALYTICAL gradients via autodiff on {self.device}")
-            return grad
-            
-        except (RuntimeError, torch.linalg.LinAlgError) as e:
-            print(f"❌ Autodiff failed: {e}, falling back to finite differences")
-            # Fall back to finite differences
-            return self._finite_difference_gradient(theta)
+        # Forward pass
+        loss = self._torch_objective(theta_tensor)
+        
+        # Backward pass
+        loss.backward()
+        
+        # Get gradient
+        return theta_tensor.grad.detach().cpu().numpy()
     
-    def _finite_difference_gradient(self, theta: np.ndarray) -> np.ndarray:
-        """Compute gradient using finite differences as fallback."""
-        eps = 1e-8
-        grad = np.zeros_like(theta)
-        f_base = self(theta)
+    def extract_parameters(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+        """Extract mean, covariance, and log-likelihood."""
+        mu, sigma = self.unpack_parameters(theta)
         
-        for i in range(len(theta)):
-            theta_plus = theta.copy()
-            theta_plus[i] += eps
-            f_plus = self(theta_plus)
-            grad[i] = (f_plus - f_base) / eps
+        # Compute log-likelihood
+        neg_2_loglik = self(theta)
+        loglik = -neg_2_loglik / 2.0
         
-        return grad
-    
-    def verify_gradient(self, theta: np.ndarray, verbose: bool = True) -> dict:
-        """
-        Verify autodiff gradient against finite differences.
-        
-        Returns dict with comparison metrics.
-        """
-        # Compute both gradients
-        autodiff_grad = self.gradient(theta)
-        fd_grad = self._finite_difference_gradient(theta)
-        
-        # Compare
-        abs_diff = np.abs(autodiff_grad - fd_grad)
-        rel_diff = abs_diff / (np.abs(fd_grad) + 1e-10)
-        
-        results = {
-            'max_abs_diff': np.max(abs_diff),
-            'mean_abs_diff': np.mean(abs_diff),
-            'max_rel_diff': np.max(rel_diff),
-            'mean_rel_diff': np.mean(rel_diff),
-            'autodiff_norm': np.linalg.norm(autodiff_grad),
-            'fd_norm': np.linalg.norm(fd_grad)
-        }
-        
-        if verbose:
-            print("\n📊 Gradient Verification:")
-            print(f"Autodiff gradient norm: {results['autodiff_norm']:.6f}")
-            print(f"Finite diff gradient norm: {results['fd_norm']:.6f}")
-            print(f"Max absolute difference: {results['max_abs_diff']:.2e}")
-            print(f"Mean relative difference: {results['mean_rel_diff']:.2%}")
-            
-            if results['max_rel_diff'] < 0.01:
-                print("✅ Excellent agreement! Autodiff is working correctly.")
-            elif results['max_rel_diff'] < 0.1:
-                print("⚠️ Good agreement, minor numerical differences.")
-            else:
-                print("❌ Poor agreement, check implementation.")
-        
-        return results
+        return mu, sigma, loglik

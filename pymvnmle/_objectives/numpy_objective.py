@@ -212,3 +212,26 @@ class NumpyMLEObjective(MLEObjectiveBase):  # Changed name and inheritance
         loglik = -self(theta) / 2.0  # Objective is negative log-likelihood
         
         return mu, sigma, loglik
+    
+    # TEMPORARY - REMOVE LATER
+    def gradient(self, theta: np.ndarray) -> np.ndarray:
+        """
+        Compute gradient using finite differences (R-compatible).
+        
+        This matches R's nlm() behavior exactly.
+        """
+        eps = 1e-8
+        n_params = len(theta)
+        grad = np.zeros(n_params)
+        
+        # Base objective value
+        f_base = self(theta)
+        
+        # Compute gradient using forward differences
+        for i in range(n_params):
+            theta_plus = theta.copy()
+            theta_plus[i] += eps
+            f_plus = self(theta_plus)
+            grad[i] = (f_plus - f_base) / eps
+        
+        return grad

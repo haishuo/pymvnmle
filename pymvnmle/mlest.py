@@ -387,8 +387,3 @@ def mlest(data: Union[np.ndarray, pd.DataFrame],
         print("not analytical gradients, for this problem!")
     
     return result
-
-# For backwards compatibility
-def ml_estimate(data, **kwargs):
-    """Alias for mlest() function."""
-    return mlest(data, **kwargs)

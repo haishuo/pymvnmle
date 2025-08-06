@@ -261,8 +261,7 @@ class GPUObjectiveFP64(MLEObjectiveBase):
             # Weight by number of observations
             obj_value = obj_value + gpu_pattern['n_obs'] * contrib
         
-        # CRITICAL: Multiply by 2 for R compatibility (-2 * log-likelihood)
-        return 2.0 * obj_value.squeeze()
+        return obj_value.squeeze()
     
     def _compute_pattern_contribution_gpu(self, pattern: Dict,
                                          mu_k: Any,

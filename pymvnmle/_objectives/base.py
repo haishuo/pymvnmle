@@ -282,15 +282,17 @@ class MLEObjectiveBase:
     
     def _compute_sample_covariance(self) -> np.ndarray:
         """
-        Compute sample covariance using pairwise deletion.
+        Compute sample covariance using pairwise deletion with proper regularization.
         
         This matches R's approach for getting initial parameter estimates.
         Uses only pairs of observations where both variables are observed.
         
+        CRITICAL FIX: Proper regularization for non-positive definite matrices.
+        
         Returns
         -------
         np.ndarray, shape (n_vars, n_vars)
-            Sample covariance matrix (positive definite)
+            Sample covariance matrix (guaranteed positive definite)
         """
         cov = np.zeros((self.n_vars, self.n_vars))
         
@@ -322,21 +324,37 @@ class MLEObjectiveBase:
                     # Not enough data for this variable, use unit variance
                     cov[i, i] = 1.0
         
-        # Ensure positive definite
+        # CRITICAL FIX: Proper regularization for positive definiteness
         try:
             eigenvals = np.linalg.eigvalsh(cov)
             min_eigenval = np.min(eigenvals)
+            max_eigenval = np.max(eigenvals)
             
             if min_eigenval <= 0:
-                # Add regularization to make positive definite
-                regularization = max(1e-6, abs(min_eigenval) + 1e-6)
+                # Add enough regularization to ensure positive definiteness
+                # Use 1% of the largest eigenvalue or 0.01, whichever is larger
+                regularization = max(0.01, 0.01 * max_eigenval, abs(min_eigenval) + 0.01)
                 cov += regularization * np.eye(self.n_vars)
+                
+                # Also shrink off-diagonal elements to improve conditioning
+                # This helps prevent extreme values in the inverse
+                shrink_factor = 0.95
+                for i in range(self.n_vars):
+                    for j in range(i + 1, self.n_vars):
+                        cov[i, j] *= shrink_factor
+                        cov[j, i] *= shrink_factor
+                        
+            elif min_eigenval < 1e-4:
+                # Even if positive definite, ensure reasonable conditioning
+                regularization = 1e-4
+                cov += regularization * np.eye(self.n_vars)
+                
         except np.linalg.LinAlgError:
             # If eigenvalue computation fails, use diagonal matrix
             cov = np.diag(np.maximum(np.diag(cov), 1.0))
         
         return cov
-    
+
     def get_pattern_info(self) -> Dict[str, Any]:
         """
         Get information about patterns and optimization status.

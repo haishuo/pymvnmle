@@ -4,8 +4,8 @@ CPU objective function using R's inverse Cholesky parameterization.
 This implementation exactly matches R's mvnmle package, using the same
 parameterization and computational approach for complete R compatibility.
 
-CRITICAL FIX: Now includes row shuffling and Givens rotations that were
-missing in the refactored version.
+CRITICAL: This is an EXACT port of the working numpy_objective.py that passed
+all regulatory tests, just adapted to the new class structure.
 """
 
 import numpy as np
@@ -18,24 +18,12 @@ class CPUObjectiveFP64(MLEObjectiveBase):
     """
     R-compatible MLE objective using inverse Cholesky parameterization.
     
-    This is the reference implementation that exactly matches R's mvnmle,
-    including the critical row shuffling and Givens rotations algorithms.
-    
-    The objective returns -2 * log-likelihood, matching R's convention.
+    This is the reference implementation that exactly matches R's mvnmle.
+    EXACT copy of the working numpy_objective.py with new class names.
     """
     
     def __init__(self, data: np.ndarray, validate: bool = True):
-        """
-        Initialize CPU objective with R-compatible settings.
-        
-        Parameters
-        ----------
-        data : np.ndarray, shape (n_obs, n_vars)
-            Input data with missing values as np.nan
-        validate : bool
-            Whether to validate input data
-        """
-        # Initialize base class (handles preprocessing)
+        """Initialize CPU objective with R-compatible settings."""
         super().__init__(data, validate)
         
         # Create parameterization
@@ -61,15 +49,8 @@ class CPUObjectiveFP64(MLEObjectiveBase):
         )
     
     def get_initial_parameters(self) -> np.ndarray:
-        """
-        Get R-compatible initial parameters with improved robustness.
-        
-        Returns
-        -------
-        np.ndarray
-            Initial parameter vector using inverse Cholesky parameterization
-        """
-        # For very difficult datasets, may need more conservative initialization
+        """Get R-compatible initial parameters."""
+        # For difficult datasets, may need conservative initialization
         sample_cov_regularized = self.sample_cov.copy()
         
         # Check condition number
@@ -78,19 +59,18 @@ class CPUObjectiveFP64(MLEObjectiveBase):
             min_eig = np.min(eigenvals)
             max_eig = np.max(eigenvals)
             
-            # If poorly conditioned or non-PD, regularize more aggressively
+            # If poorly conditioned or non-PD, regularize
             if min_eig < 1e-6 or max_eig / min_eig > 1e10:
-                # Add stronger regularization
                 reg_amount = max(1e-4, abs(min_eig) + 1e-4)
                 sample_cov_regularized += reg_amount * np.eye(self.n_vars)
                 
-                # Also shrink off-diagonals slightly for stability
+                # Shrink off-diagonals for stability
                 for i in range(self.n_vars):
                     for j in range(i + 1, self.n_vars):
                         sample_cov_regularized[i, j] *= 0.95
                         sample_cov_regularized[j, i] *= 0.95
         except np.linalg.LinAlgError:
-            # If eigenvalue computation fails, use diagonal covariance
+            # If eigenvalue computation fails, use diagonal
             sample_cov_regularized = np.diag(np.diag(self.sample_cov))
             sample_cov_regularized += 0.1 * np.eye(self.n_vars)
         
@@ -99,390 +79,223 @@ class CPUObjectiveFP64(MLEObjectiveBase):
             sample_cov_regularized
         )
     
-    def compute_objective(self, theta: np.ndarray) -> float:
+    def _reconstruct_delta_matrix(self, theta: np.ndarray) -> np.ndarray:
         """
-        Compute -2 * log-likelihood (R convention) with exact R algorithms.
+        Reconstruct upper triangular Δ matrix from parameter vector.
         
-        Parameters
-        ----------
-        theta : np.ndarray
-            Parameter vector [μ, log(diag(Δ)), off-diag(Δ)]
-            
-        Returns
-        -------
-        float
-            -2 * log-likelihood value
-            
-        Notes
-        -----
-        This implementation now includes the CRITICAL row shuffling and
-        Givens rotations that are essential for R compatibility.
+        EXACT copy from working numpy_objective.py
         """
-        try:
-            # Extract mu and reconstruct Delta matrix
-            mu = theta[:self.n_vars].copy()
-            delta = self._reconstruct_delta(theta)
-            
-            # Check for numerical issues in Delta
-            diag_vals = np.diag(delta)
-            if np.any(diag_vals <= 0) or np.any(~np.isfinite(delta)):
-                return 1e10  # Return large value for invalid parameters
-            
-            # Initialize objective value
-            obj_value = 0.0
-            
-            # Process each missingness pattern
-            for pattern in self.patterns:
-                if len(pattern.observed_indices) == 0:
-                    continue  # Skip patterns with no observed variables
-                
-                # Apply R's row shuffling algorithm
-                subdel = self._row_shuffle(delta, pattern.observed_indices)
-                
-                # Apply Givens rotations for numerical stability
-                subdel = self._apply_givens_rotations(subdel)
-                
-                # Extract the relevant submatrix for observed variables
-                n_obs_vars = len(pattern.observed_indices)
-                delta_k = subdel[:n_obs_vars, :n_obs_vars]
-                
-                # Check numerical stability of delta_k
-                diag_k = np.diag(delta_k)
-                if np.any(diag_k <= 1e-10) or np.any(~np.isfinite(delta_k)):
-                    return 1e10  # Return large value for singular matrix
-                
-                # Compute log-determinant contribution
-                # In R: diagsum = sum(log(diag(subdel[1:pcount, 1:pcount])))
-                # obj_value -= 2 * n_k * diagsum
-                log_det_delta_k = np.sum(np.log(diag_k))
-                if not np.isfinite(log_det_delta_k):
-                    return 1e10
-                
-                obj_value -= 2.0 * pattern.n_obs * log_det_delta_k
-                
-                # Extract observed means
-                mu_k = mu[pattern.observed_indices]
-                
-                # Compute quadratic form contribution
-                # In R: for each observation, compute prod = subdel.T @ (y - mu)
-                # then sum(prod^2)
-                for i in range(pattern.n_obs):
-                    obs_data = pattern.data[i, :]  # Already has only observed columns
-                    centered = obs_data - mu_k
-                    prod = delta_k.T @ centered
-                    quad_term = np.dot(prod, prod)
-                    if not np.isfinite(quad_term):
-                        return 1e10
-                    obj_value += quad_term
-            
-            # Final check
-            if not np.isfinite(obj_value):
-                return 1e10
-                
-            return obj_value
-            
-        except (np.linalg.LinAlgError, ValueError):
-            # Return large value for any numerical errors
-            return 1e10
-    
-    def _reconstruct_delta(self, theta: np.ndarray) -> np.ndarray:
-        """
-        Reconstruct Delta matrix from parameter vector.
+        Delta = np.zeros((self.n_vars, self.n_vars))
         
-        EXACTLY matches R's parameter ordering and structure.
-        
-        Parameters
-        ----------
-        theta : np.ndarray
-            Parameter vector
-            
-        Returns
-        -------
-        np.ndarray
-            Upper triangular Delta matrix
-        """
-        delta = np.zeros((self.n_vars, self.n_vars))
-        
-        # Diagonal elements (from log parameters)
+        # Diagonal elements: exp(log-parameters) to ensure positivity
         log_diag = theta[self.n_vars:2*self.n_vars]
+        np.fill_diagonal(Delta, np.exp(log_diag))
         
-        # Clip to prevent overflow/underflow
-        log_diag = np.clip(log_diag, -10, 10)
-        
-        # Set diagonal with bounds checking
-        diag_vals = np.exp(log_diag)
-        diag_vals = np.maximum(diag_vals, 1e-10)  # Prevent zero diagonal
-        np.fill_diagonal(delta, diag_vals)
-        
-        # Off-diagonal elements (R's column-major ordering)
+        # Off-diagonal elements in R's column-major order
         idx = 2 * self.n_vars
-        for j in range(1, self.n_vars):  # Column
-            for i in range(j):           # Row within column
-                if idx < len(theta):
-                    # Clip extreme values
-                    val = theta[idx]
-                    val = np.clip(val, -100, 100)
-                    delta[i, j] = val
-                    idx += 1
+        for j in range(self.n_vars):
+            for i in range(j):
+                Delta[i, j] = theta[idx]
+                idx += 1
         
-        return delta
-    
-    def _row_shuffle(self, delta: np.ndarray, observed_indices: np.ndarray) -> np.ndarray:
-        """
-        Apply R's row shuffling algorithm.
-        
-        This is CRITICAL for the inverse Cholesky parameterization to work
-        correctly with missing data patterns.
-        
-        From evallf.c:
-        - Put rows corresponding to observed variables FIRST
-        - Put rows corresponding to missing variables LAST
-        
-        Parameters
-        ----------
-        delta : np.ndarray
-            Full Delta matrix
-        observed_indices : np.ndarray
-            Indices of observed variables for this pattern
-            
-        Returns
-        -------
-        np.ndarray
-            Row-shuffled matrix
-        """
-        subdel = np.zeros_like(delta)
-        n_vars = self.n_vars
-        
-        # Put observed variable rows first
-        pcount = 0
-        for i in range(n_vars):
-            if i in observed_indices:
-                subdel[pcount, :] = delta[i, :]
-                pcount += 1
-        
-        # Put missing variable rows last
-        acount = 0
-        for i in range(n_vars):
-            if i not in observed_indices:
-                subdel[n_vars - acount - 1, :] = delta[i, :]
-                acount += 1
-        
-        return subdel
+        return Delta
     
     def _apply_givens_rotations(self, matrix: np.ndarray) -> np.ndarray:
         """
-        Apply Givens rotations to zero out elements below main diagonal.
+        Apply Givens rotations for numerical stability.
         
-        This is the EXACT algorithm from R's evallf.c, critical for
-        numerical stability.
-        
-        Parameters
-        ----------
-        matrix : np.ndarray
-            Matrix to apply rotations to
-            
-        Returns
-        -------
-        np.ndarray
-            Matrix with Givens rotations applied
+        EXACT copy from working numpy_objective.py - CRITICAL for R compatibility.
+        Matches R's evallf.c implementation precisely.
         """
         result = matrix.copy()
-        n_vars = self.n_vars
         
-        # Process from bottom to top (R's exact order)
-        for i in range(n_vars - 1, -1, -1):  # Bottom row moving up
-            for j in range(i):                # Left to diagonal
-                # Zero out result[i, j]
+        # R's exact algorithm: bottom-up, left-to-right
+        for i in range(self.n_vars - 1, -1, -1):  # Bottom to top
+            for j in range(i):  # Left to diagonal
                 a = result[i, j]
+                b = result[i, j+1] if j+1 < self.n_vars else 0.0
                 
-                # R's threshold: 0.000001
-                if abs(a) < 0.000001:
-                    result[i, j] = 0.0
-                    continue
-                
-                # Get next element
-                b = result[i, j + 1] if j + 1 < n_vars else 0.0
-                
-                # Skip if both elements are too small
-                if abs(a) < 0.000001 and abs(b) < 0.000001:
+                # R's exact threshold
+                if np.abs(a) < 0.000001:
                     result[i, j] = 0.0
                     continue
                 
                 # Compute rotation parameters
-                r = np.sqrt(a * a + b * b)
+                r = np.sqrt(a*a + b*b)
                 if r < 0.000001:
-                    result[i, j] = 0.0
                     continue
                 
-                c = a / r  # cos(theta)
-                d = b / r  # sin(theta)
+                c = a / r
+                d = b / r
                 
                 # Apply rotation to entire matrix
-                for k in range(n_vars):
+                for k in range(self.n_vars):
                     old_kj = result[k, j]
-                    old_kj1 = result[k, j + 1] if j + 1 < n_vars else 0.0
+                    old_kj1 = result[k, j+1] if j+1 < self.n_vars else 0.0
                     
                     result[k, j] = d * old_kj - c * old_kj1
-                    if j + 1 < n_vars:
-                        result[k, j + 1] = c * old_kj + d * old_kj1
+                    if j+1 < self.n_vars:
+                        result[k, j+1] = c * old_kj + d * old_kj1
                 
                 result[i, j] = 0.0
         
-        # Flip column signs so diagonal elements are positive
-        for i in range(n_vars):
-            if i < n_vars and result[i, i] < 0:
-                # Only flip up to and including row i
-                result[:i + 1, i] *= -1
+        # Ensure positive diagonal (R's sign adjustment)
+        for i in range(self.n_vars):
+            if result[i, i] < 0:
+                for j in range(i+1):
+                    result[j, i] *= -1
         
         return result
     
-    def _compute_pattern_contribution(self, pattern: PatternData, 
-                                     mu: np.ndarray, 
-                                     sigma: np.ndarray) -> float:
+    def compute_objective(self, theta: np.ndarray) -> float:
         """
-        Compute log-likelihood contribution from one missingness pattern.
+        Compute negative log-likelihood using R's exact algorithm.
         
-        NOTE: This method is now DEPRECATED in favor of the direct
-        computation in compute_objective() that uses row shuffling
-        and Givens rotations. Kept for backward compatibility only.
+        EXACT copy of __call__ from working numpy_objective.py
+        """
+        # Extract mean parameters
+        mu = theta[:self.n_vars]
         
-        Parameters
-        ----------
-        pattern : PatternData
-            Pattern data structure
-        mu : np.ndarray, shape (n_vars,)
-            Mean vector
-        sigma : np.ndarray, shape (n_vars, n_vars)
-            Covariance matrix
+        # Reconstruct Δ matrix using R's algorithm
+        Delta = self._reconstruct_delta_matrix(theta)
+        
+        # Apply Givens rotations for numerical stability (R's evallf.c)
+        Delta_stabilized = self._apply_givens_rotations(Delta)
+        
+        # Compute negative log-likelihood using pattern-wise formula
+        neg_loglik = 0.0
+        
+        for pattern in self.patterns:
+            # Skip empty patterns - using n_obs instead of n_k
+            if pattern.n_obs == 0 or len(pattern.observed_indices) == 0:
+                continue
             
-        Returns
-        -------
-        float
-            Pattern's contribution to -2 * log-likelihood
-        """
-        obs_idx = pattern.observed_indices
-        n_obs_vars = len(obs_idx)
+            # Extract relevant submatrices (R's approach)
+            obs_indices = pattern.observed_indices
+            n_obs_vars = len(obs_indices)
+            mu_k = mu[obs_indices]
+            
+            # CRITICAL: Implement R's row shuffling algorithm exactly
+            # Create reordered Delta with observed rows first, missing rows last
+            subdel = np.zeros((self.n_vars, self.n_vars))
+            
+            # Put observed variable rows FIRST
+            pcount = 0
+            for i in range(self.n_vars):
+                if i in obs_indices:
+                    subdel[pcount, :] = Delta_stabilized[i, :]
+                    pcount += 1
+            
+            # Put missing variable rows LAST
+            acount = 0
+            for i in range(self.n_vars):
+                if i not in obs_indices:
+                    subdel[self.n_vars - acount - 1, :] = Delta_stabilized[i, :]
+                    acount += 1
+            
+            # Apply Givens rotations to shuffled matrix
+            subdel_rotated = self._apply_givens_rotations(subdel)
+            
+            # Extract top-left submatrix for observed variables
+            Delta_k = subdel_rotated[:n_obs_vars, :n_obs_vars]
+            
+            try:
+                # Use R's exact computation approach
+                # Log-determinant of Delta_k (more stable than computing Sigma_k first)
+                log_det_delta_k = np.sum(np.log(np.diag(Delta_k)))
+                
+                # Compute quadratic form efficiently
+                # For each observation, compute (y - μ)'Σ^{-1}(y - μ)
+                # Using Σ = (Δ^{-1})'Δ^{-1}, we get (Δ'(y - μ))'(Δ'(y - μ))
+                obj_contribution = -2 * pattern.n_obs * log_det_delta_k
+                
+                for i in range(pattern.n_obs):
+                    # pattern.data already has only observed columns
+                    centered = pattern.data[i] - mu_k
+                    # prod = Δ_k' @ centered
+                    prod = Delta_k.T @ centered
+                    obj_contribution += np.dot(prod, prod)
+                
+                neg_loglik += obj_contribution
+                
+            except (np.linalg.LinAlgError, RuntimeError):
+                # Handle numerical issues
+                return 1e20
         
-        # Extract observed submatrices
-        mu_k = mu[obs_idx]
-        sigma_k = sigma[np.ix_(obs_idx, obs_idx)]
-        
-        # Constant term
-        const_term = n_obs_vars * self.log_2pi
-        
-        # Log determinant term
-        try:
-            # Use Cholesky for numerical stability
-            L_k = np.linalg.cholesky(sigma_k)
-            log_det_sigma_k = 2.0 * np.sum(np.log(np.diag(L_k)))
-        except np.linalg.LinAlgError:
-            # Fallback to eigenvalues if Cholesky fails
-            eigenvals = np.linalg.eigvalsh(sigma_k)
-            if np.min(eigenvals) <= 0:
-                return 1e10  # Return large value for non-PD matrix
-            log_det_sigma_k = np.sum(np.log(eigenvals))
-        
-        # Compute sample covariance for this pattern
-        data_centered = pattern.data - mu_k
-        S_k = (data_centered.T @ data_centered) / pattern.n_obs
-        
-        # Trace term: tr(Σ_k^-1 * S_k)
-        try:
-            # Solve Σ_k * X = S_k for X, then tr(X) = tr(Σ_k^-1 * S_k)
-            sigma_k_inv_S_k = np.linalg.solve(sigma_k, S_k)
-            trace_term = np.trace(sigma_k_inv_S_k)
-        except np.linalg.LinAlgError:
-            # Use pseudoinverse if singular
-            sigma_k_inv = np.linalg.pinv(sigma_k)
-            trace_term = np.trace(sigma_k_inv @ S_k)
-        
-        # Combine terms (already scaled by -2)
-        contribution = const_term + log_det_sigma_k + trace_term
-        
-        return contribution
+        return neg_loglik
     
     def compute_gradient(self, theta: np.ndarray, eps: float = 1e-8) -> np.ndarray:
         """
         Compute gradient using finite differences (R-compatible).
         
-        R uses finite differences, not analytical gradients.
-        
-        Parameters
-        ----------
-        theta : np.ndarray
-            Parameter vector
-        eps : float
-            Finite difference step size
-            
-        Returns
-        -------
-        np.ndarray
-            Gradient vector
+        This matches R's nlm() behavior exactly.
         """
-        grad = np.zeros_like(theta)
-        f0 = self.compute_objective(theta)
+        n_params = len(theta)
+        grad = np.zeros(n_params)
+        
+        # Base objective value
+        f_base = self.compute_objective(theta)
         
         # Check if objective is valid
-        if not np.isfinite(f0) or f0 > 1e9:
-            # Return zero gradient to avoid propagating NaN
+        if not np.isfinite(f_base) or f_base > 1e9:
             return grad
         
-        for i in range(len(theta)):
+        # Compute gradient using forward differences
+        for i in range(n_params):
             theta_plus = theta.copy()
+            theta_plus[i] += eps
             
-            # Use adaptive step size for different parameter types
-            if i < self.n_vars:
-                # Mean parameters - use standard eps
-                step = eps
-            elif i < 2 * self.n_vars:
-                # Log-diagonal parameters - use smaller step
-                step = eps * 0.1
-            else:
-                # Off-diagonal parameters - use standard eps
-                step = eps
-            
-            theta_plus[i] += step
-            f_plus = self.compute_objective(theta_plus)
-            
-            # Check for numerical issues
-            if np.isfinite(f_plus) and f_plus < 1e9:
-                grad[i] = (f_plus - f0) / step
-            else:
-                # Try negative direction
-                theta_minus = theta.copy()
-                theta_minus[i] -= step
-                f_minus = self.compute_objective(theta_minus)
-                
-                if np.isfinite(f_minus) and f_minus < 1e9:
-                    grad[i] = (f0 - f_minus) / step
+            try:
+                f_plus = self.compute_objective(theta_plus)
+                if np.isfinite(f_plus) and f_plus < 1e9:
+                    grad[i] = (f_plus - f_base) / eps
                 else:
-                    # Both directions failed, use zero
-                    grad[i] = 0.0
-        
-        # Clip extreme gradients to prevent optimizer instability
-        max_grad = 1000.0
-        grad = np.clip(grad, -max_grad, max_grad)
+                    # Try backward difference
+                    theta_minus = theta.copy()
+                    theta_minus[i] -= eps
+                    f_minus = self.compute_objective(theta_minus)
+                    if np.isfinite(f_minus) and f_minus < 1e9:
+                        grad[i] = (f_base - f_minus) / eps
+                    else:
+                        grad[i] = 0.0
+            except:
+                grad[i] = 0.0
         
         return grad
     
-    def compute_hessian(self, theta: np.ndarray, eps: float = 1e-5) -> np.ndarray:
+    def extract_parameters(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
         """
-        Compute Hessian using finite differences.
+        Extract estimates from parameter vector.
         
-        Used for Newton-CG optimization if requested.
+        EXACT copy from working numpy_objective.py
+        """
+        # Extract mean parameters
+        mu = theta[:self.n_vars]
         
-        Parameters
-        ----------
-        theta : np.ndarray
-            Parameter vector
-        eps : float
-            Finite difference step size
+        # Reconstruct Δ matrix using R's algorithm
+        Delta = self._reconstruct_delta_matrix(theta)
+        
+        # Convert to covariance matrix: Σ = (Δ⁻¹)ᵀ Δ⁻¹
+        try:
+            # Use triangular solve for numerical stability (R's approach)
+            I = np.eye(self.n_vars)
+            Delta_inv = np.linalg.solve(Delta, I)  # More stable than inv(Delta)
+            sigma = Delta_inv.T @ Delta_inv
             
-        Returns
-        -------
-        np.ndarray, shape (n_params, n_params)
-            Hessian matrix
-        """
+            # Ensure exact symmetry (R does this)
+            sigma = (sigma + sigma.T) / 2.0
+            
+        except np.linalg.LinAlgError:
+            # Fallback for numerical issues
+            sigma = np.eye(self.n_vars)
+        
+        # Compute log-likelihood
+        loglik = -self.compute_objective(theta) / 2.0  # Objective is -2*log-likelihood
+        
+        return mu, sigma, loglik
+    
+    def compute_hessian(self, theta: np.ndarray, eps: float = 1e-5) -> np.ndarray:
+        """Compute Hessian using finite differences."""
         n = len(theta)
         hessian = np.zeros((n, n))
         
@@ -503,49 +316,8 @@ class CPUObjectiveFP64(MLEObjectiveBase):
         
         return hessian
     
-    def extract_parameters(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
-        """
-        Extract mu, sigma, and log-likelihood from parameter vector.
-        
-        Parameters
-        ----------
-        theta : np.ndarray
-            Parameter vector
-            
-        Returns
-        -------
-        mu : np.ndarray
-            Mean estimate
-        sigma : np.ndarray
-            Covariance estimate  
-        loglik : float
-            Log-likelihood value
-        """
-        # Unpack parameters
-        mu, sigma = self.parameterization.unpack(theta)
-        
-        # Compute log-likelihood
-        neg2_loglik = self.compute_objective(theta)
-        loglik = -0.5 * neg2_loglik
-        
-        return mu, sigma, loglik
-    
     def validate_parameters(self, theta: np.ndarray) -> Tuple[bool, str]:
-        """
-        Validate parameter vector.
-        
-        Parameters
-        ----------
-        theta : np.ndarray
-            Parameter vector
-            
-        Returns
-        -------
-        valid : bool
-            True if parameters are valid
-        message : str
-            Error message if invalid
-        """
+        """Validate parameter vector."""
         # Check length
         if len(theta) != self.n_params:
             return False, f"Expected {self.n_params} parameters, got {len(theta)}"
@@ -569,23 +341,7 @@ class CPUObjectiveFP64(MLEObjectiveBase):
     def check_convergence(self, theta: np.ndarray,
                          grad: Optional[np.ndarray] = None,
                          tol: float = 1e-6) -> bool:
-        """
-        Check convergence based on gradient norm.
-        
-        Parameters
-        ----------
-        theta : np.ndarray
-            Current parameters
-        grad : np.ndarray or None
-            Current gradient (computed if None)
-        tol : float
-            Convergence tolerance
-            
-        Returns
-        -------
-        bool
-            True if converged
-        """
+        """Check convergence based on gradient norm."""
         if grad is None:
             grad = self.compute_gradient(theta)
         

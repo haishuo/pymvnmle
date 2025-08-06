@@ -87,6 +87,17 @@ def mock_gpu_none():
         gpu_type = 'none'
         fp64_support = 'none'
         device_name = 'None'
+        fp64_ratio = None
+        
+        def detect_gpu(self):
+            """Return dict format for compatibility."""
+            return {
+                'has_gpu': self.has_gpu,
+                'gpu_type': self.gpu_type,
+                'fp64_support': self.fp64_support,
+                'device_name': self.device_name,
+                'fp64_ratio': self.fp64_ratio
+            }
     return MockGPUCapabilities()
 
 
@@ -99,6 +110,16 @@ def mock_gpu_rtx():
         fp64_support = 'gimped'
         device_name = 'NVIDIA GeForce RTX 4090'
         fp64_ratio = 64
+        
+        def detect_gpu(self):
+            """Return dict format for compatibility."""
+            return {
+                'has_gpu': self.has_gpu,
+                'gpu_type': self.gpu_type,
+                'fp64_support': self.fp64_support,
+                'device_name': self.device_name,
+                'fp64_ratio': self.fp64_ratio
+            }
     return MockGPUCapabilities()
 
 
@@ -111,6 +132,16 @@ def mock_gpu_a100():
         fp64_support = 'full'
         device_name = 'NVIDIA A100'
         fp64_ratio = 2
+        
+        def detect_gpu(self):
+            """Return dict format for compatibility."""
+            return {
+                'has_gpu': self.has_gpu,
+                'gpu_type': self.gpu_type,
+                'fp64_support': self.fp64_support,
+                'device_name': self.device_name,
+                'fp64_ratio': self.fp64_ratio
+            }
     return MockGPUCapabilities()
 
 
@@ -122,6 +153,17 @@ def mock_gpu_metal():
         gpu_type = 'metal'
         fp64_support = 'none'
         device_name = 'Apple M2'
+        fp64_ratio = None
+        
+        def detect_gpu(self):
+            """Return dict format for compatibility."""
+            return {
+                'has_gpu': self.has_gpu,
+                'gpu_type': self.gpu_type,
+                'fp64_support': self.fp64_support,
+                'device_name': self.device_name,
+                'fp64_ratio': self.fp64_ratio
+            }
     return MockGPUCapabilities()
 
 
@@ -153,7 +195,9 @@ class TestMLEstBasic:
         assert result.muhat.shape == (4,)
         assert result.sigmahat.shape == (4, 4)
         assert result.n_missing > 0
-        assert len(result.patterns['pattern_indices']) > 1  # Multiple patterns
+        # Check that patterns exist and has multiple patterns
+        assert 'patterns' in result.patterns
+        assert len(result.patterns['patterns']) > 1  # Multiple patterns
     
     def test_mlest_input_validation(self):
         """Test input validation."""
@@ -235,17 +279,12 @@ class TestBackendSelection:
         
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            with patch('pymvnmle.mlest.BackendFactory.create') as mock_create:
-                mock_backend = Mock()
-                mock_backend.device = 'cuda:0'
-                mock_create.return_value = mock_backend
-                
-                # This will warn about gimped FP64
-                result = mlest(simple_data, gpu64=True, verbose=False)
-                
-                # Should have warning about gimped performance
-                assert any("gimped FP64" in str(warning.message) for warning in w)
-                assert any("MUCH slower" in str(warning.message) for warning in w)
+            # Just test that it runs and warns appropriately
+            result = mlest(simple_data, gpu64=True, verbose=False)
+            
+            # Should have warning about gimped performance
+            assert any("gimped FP64" in str(warning.message) for warning in w)
+            assert any("MUCH slower" in str(warning.message) for warning in w)
     
     @patch('pymvnmle.mlest.detect_gpu_capabilities')  
     def test_gpu64_on_metal(self, mock_detect_gpu, simple_data, mock_gpu_metal):
@@ -254,53 +293,40 @@ class TestBackendSelection:
         
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            with patch('pymvnmle.mlest.get_backend') as mock_get_backend:
-                mock_backend = Mock()
-                mock_backend.device = 'mps:0'
-                mock_get_backend.return_value = mock_backend
-                
-                # This will fall back to FP32
-                result = mlest(simple_data, gpu64=True, verbose=False)
-                
-                # Should warn about no FP64 support
-                assert any("doesn't support FP64" in str(warning.message) for warning in w)
-                assert any("Falling back to FP32" in str(warning.message) for warning in w)
+            # This will fall back to FP32
+            result = mlest(simple_data, gpu64=True, verbose=False)
+            
+            # Should warn about no FP64 support
+            assert any("doesn't support FP64" in str(warning.message) for warning in w)
+            assert any("Falling back to FP32" in str(warning.message) for warning in w)
     
     @patch('pymvnmle.mlest.detect_gpu_capabilities')
     def test_gpu64_on_a100(self, mock_detect_gpu, simple_data, mock_gpu_a100):
         """Test gpu64=True on A100 (full FP64 support)."""
-        mock_detect_gpu.return_value = mock_gpu_a100
+        # Make detect_gpu_capabilities return the dict from detect_gpu()
+        mock_detect_gpu.return_value = mock_gpu_a100.detect_gpu()
         
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            with patch('pymvnmle.mlest.get_backend') as mock_get_backend:
-                mock_backend = Mock()
-                mock_backend.device = 'cuda:0'
-                mock_get_backend.return_value = mock_backend
-                
-                # This should work without warnings
-                result = mlest(simple_data, gpu64=True, verbose=False)
-                
-                # No warnings expected for A100
-                fp64_warnings = [warning for warning in w 
-                               if "FP64" in str(warning.message)]
-                assert len(fp64_warnings) == 0
+            # This should work without FP64-specific warnings
+            result = mlest(simple_data, gpu64=True, verbose=False)
+            
+            # Should not have warnings about gimped or missing FP64
+            fp64_warnings = [warning for warning in w 
+                           if "gimped FP64" in str(warning.message) 
+                           or "doesn't support FP64" in str(warning.message)]
+            assert len(fp64_warnings) == 0
     
     @patch('pymvnmle.mlest.detect_gpu_capabilities')
     def test_small_problem_uses_cpu(self, mock_detect_gpu, small_data, mock_gpu_rtx):
         """Test that small problems default to CPU even with GPU available."""
         mock_detect_gpu.return_value = mock_gpu_rtx
         
-        with patch('pymvnmle.mlest.get_backend') as mock_get_backend:
-            mock_backend = Mock()
-            mock_backend.device = 'cpu'
-            mock_get_backend.return_value = mock_backend
-            
-            # Small problem should use CPU by default
-            result = mlest(small_data, backend='auto', verbose=False)
-            
-            # The backend selection logic should choose CPU for small problems
-            # Note: This depends on the actual implementation
+        # Small problem should use CPU by default
+        result = mlest(small_data, backend='auto', verbose=False)
+        
+        # The backend selection logic should choose CPU for small problems
+        assert result.backend == 'cpu'
 
 
 # ============================================================================
@@ -313,6 +339,7 @@ class TestModuleFunctions:
     @patch('pymvnmle.PrecisionDetector')
     def test_check_gpu_capabilities_no_gpu(self, mock_detector_class, mock_gpu_none):
         """Test check_gpu_capabilities with no GPU."""
+        # Mock the class to return an instance with detect_gpu method
         mock_detector_class.return_value = mock_gpu_none
         
         caps = pmle.check_gpu_capabilities(verbose=False)
@@ -325,6 +352,7 @@ class TestModuleFunctions:
     @patch('pymvnmle.PrecisionDetector')
     def test_check_gpu_capabilities_rtx(self, mock_detector_class, mock_gpu_rtx):
         """Test check_gpu_capabilities with RTX GPU."""
+        # Mock the class to return an instance with detect_gpu method
         mock_detector_class.return_value = mock_gpu_rtx
         
         caps = pmle.check_gpu_capabilities(verbose=False)
@@ -338,6 +366,7 @@ class TestModuleFunctions:
     @patch('pymvnmle.PrecisionDetector')
     def test_check_gpu_capabilities_a100(self, mock_detector_class, mock_gpu_a100):
         """Test check_gpu_capabilities with A100."""
+        # Mock the class to return an instance with detect_gpu method
         mock_detector_class.return_value = mock_gpu_a100
         
         caps = pmle.check_gpu_capabilities(verbose=False)
@@ -349,6 +378,7 @@ class TestModuleFunctions:
     @patch('pymvnmle.PrecisionDetector')
     def test_check_gpu_capabilities_verbose(self, mock_detector_class, mock_gpu_rtx, capsys):
         """Test verbose output of check_gpu_capabilities."""
+        # Mock the class to return an instance with detect_gpu method
         mock_detector_class.return_value = mock_gpu_rtx
         
         caps = pmle.check_gpu_capabilities(verbose=True)

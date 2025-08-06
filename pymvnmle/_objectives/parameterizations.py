@@ -1,23 +1,17 @@
 """
-Parameterization schemes for covariance matrices.
+Parameterizations for covariance matrices in MLE optimization.
 
-This module provides different parameterizations to ensure positive definiteness
-during optimization. The key insight is that different backends and optimization
-methods work better with different parameterizations.
+Different parameterizations have different numerical properties and are
+suited for different optimization algorithms and precision levels.
 """
 
 import numpy as np
+from typing import Tuple
 from abc import ABC, abstractmethod
-from typing import Tuple, Optional
 
 
 class CovarianceParameterization(ABC):
-    """
-    Abstract base class for covariance parameterizations.
-    
-    All parameterizations must provide pack/unpack operations
-    to convert between (μ, Σ) and the parameter vector θ.
-    """
+    """Abstract base class for covariance parameterizations."""
     
     def __init__(self, n_vars: int):
         """
@@ -26,398 +20,333 @@ class CovarianceParameterization(ABC):
         Parameters
         ----------
         n_vars : int
-            Number of variables (dimension of the multivariate normal)
+            Number of variables (dimension of covariance matrix)
         """
         self.n_vars = n_vars
         self.n_mean_params = n_vars
-        self.n_cov_params = (n_vars * (n_vars + 1)) // 2
+        self.n_cov_params = n_vars + (n_vars * (n_vars - 1)) // 2
         self.n_params = self.n_mean_params + self.n_cov_params
     
     @abstractmethod
     def pack(self, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:
-        """
-        Pack mean and covariance into parameter vector.
-        
-        Parameters
-        ----------
-        mu : np.ndarray, shape (n_vars,)
-            Mean vector
-        sigma : np.ndarray, shape (n_vars, n_vars)
-            Covariance matrix (must be positive definite)
-            
-        Returns
-        -------
-        theta : np.ndarray, shape (n_params,)
-            Parameter vector
-        """
-        raise NotImplementedError
+        """Pack mean and covariance into parameter vector."""
+        pass
     
     @abstractmethod
     def unpack(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Unpack parameter vector into mean and covariance.
-        
-        Parameters
-        ----------
-        theta : np.ndarray, shape (n_params,)
-            Parameter vector
-            
-        Returns
-        -------
-        mu : np.ndarray, shape (n_vars,)
-            Mean vector
-        sigma : np.ndarray, shape (n_vars, n_vars)
-            Covariance matrix (guaranteed positive definite)
-        """
-        raise NotImplementedError
+        """Unpack parameter vector into mean and covariance."""
+        pass
     
-    @abstractmethod
     def get_initial_parameters(self, sample_mean: np.ndarray, 
                               sample_cov: np.ndarray) -> np.ndarray:
         """
-        Get initial parameter values from sample statistics.
+        Get initial parameter vector from sample statistics.
         
         Parameters
         ----------
-        sample_mean : np.ndarray, shape (n_vars,)
-            Sample mean
-        sample_cov : np.ndarray, shape (n_vars, n_vars)
-            Sample covariance
+        sample_mean : np.ndarray
+            Sample mean vector
+        sample_cov : np.ndarray
+            Sample covariance matrix
             
         Returns
         -------
-        theta : np.ndarray, shape (n_params,)
+        np.ndarray
             Initial parameter vector
         """
-        raise NotImplementedError
+        # Regularize covariance for positive definiteness
+        epsilon = 0.01
+        regularized_cov = sample_cov + epsilon * np.eye(self.n_vars)
+        
+        return self.pack(sample_mean, regularized_cov)
 
 
 class InverseCholeskyParameterization(CovarianceParameterization):
     """
-    R-compatible inverse Cholesky parameterization.
+    Inverse Cholesky parameterization (R-compatible).
     
-    This parameterization uses Δ = L⁻¹ where Σ = L'L.
-    Parameters: θ = [μ, log(diag(Δ)), off-diag(Δ)]
+    Parameters: [μ, log(diag(Δ)), off-diag(Δ)]
+    where Σ = (Δ^{-1})^T Δ^{-1} and Δ is lower triangular.
     
-    This is the EXACT parameterization used by R's mvnmle package.
-    Used for CPU backend to maintain R compatibility.
+    This matches R's mvnmle package exactly.
     """
     
     def pack(self, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:
-        """
-        Pack using inverse Cholesky parameterization (R-compatible).
-        
-        Parameters
-        ----------
-        mu : np.ndarray, shape (n_vars,)
-            Mean vector
-        sigma : np.ndarray, shape (n_vars, n_vars)
-            Covariance matrix
-            
-        Returns
-        -------
-        theta : np.ndarray
-            Parameter vector [μ, log(diag(Δ)), off-diag(Δ)]
-        """
-        n = self.n_vars
-        
-        # Compute Cholesky decomposition: Σ = L'L
-        L = np.linalg.cholesky(sigma).T  # Upper triangular
-        
-        # Compute inverse: Δ = L⁻¹
-        delta = np.linalg.inv(L)
+        """Pack using inverse Cholesky decomposition."""
+        # Compute Δ where Σ = (Δ^{-1})^T Δ^{-1}
+        L = np.linalg.cholesky(sigma)
+        delta = np.linalg.inv(L).T
         
         # Extract parameters
-        theta = np.zeros(self.n_params)
+        log_diag = np.log(np.diag(delta))
         
-        # Mean parameters
-        theta[:n] = mu
+        # Extract lower triangular elements (column-wise, R style)
+        tril_elements = []
+        for j in range(self.n_vars):
+            for i in range(j + 1, self.n_vars):
+                tril_elements.append(delta[i, j])
         
-        # Log diagonal elements of Δ
-        theta[n:2*n] = np.log(np.diag(delta))
-        
-        # Off-diagonal elements (by column, then row within column)
-        idx = 2 * n
-        for j in range(n):
-            for i in range(j):
-                theta[idx] = delta[i, j]
-                idx += 1
-        
-        return theta
+        return np.concatenate([mu, log_diag, tril_elements])
     
     def unpack(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Unpack from inverse Cholesky parameterization.
-        
-        Parameters
-        ----------
-        theta : np.ndarray
-            Parameter vector [μ, log(diag(Δ)), off-diag(Δ)]
-            
-        Returns
-        -------
-        mu : np.ndarray, shape (n_vars,)
-            Mean vector
-        sigma : np.ndarray, shape (n_vars, n_vars)
-            Covariance matrix
-        """
-        n = self.n_vars
-        
-        # Extract mean
-        mu = theta[:n].copy()
+        """Unpack from inverse Cholesky parameters."""
+        mu = theta[:self.n_vars]
         
         # Reconstruct Δ matrix
-        delta = np.zeros((n, n))
+        delta = np.zeros((self.n_vars, self.n_vars))
         
-        # Diagonal elements (exponentiated)
-        np.fill_diagonal(delta, np.exp(theta[n:2*n]))
+        # Diagonal elements
+        np.fill_diagonal(delta, np.exp(theta[self.n_vars:2*self.n_vars]))
         
-        # Off-diagonal elements
-        idx = 2 * n
-        for j in range(n):
-            for i in range(j):
+        # Off-diagonal elements (column-wise, R style)
+        idx = 2 * self.n_vars
+        for j in range(self.n_vars):
+            for i in range(j + 1, self.n_vars):
                 delta[i, j] = theta[idx]
                 idx += 1
         
-        # Compute Σ = (Δ⁻¹)'(Δ⁻¹)
+        # Compute Σ = (Δ^{-1})^T Δ^{-1}
         delta_inv = np.linalg.inv(delta)
         sigma = delta_inv.T @ delta_inv
         
-        # Ensure symmetry (numerical errors can break it)
-        sigma = 0.5 * (sigma + sigma.T)
-        
         return mu, sigma
-    
-    def get_initial_parameters(self, sample_mean: np.ndarray,
-                              sample_cov: np.ndarray) -> np.ndarray:
-        """
-        Get R-compatible initial parameters.
-        
-        Uses the same initialization as R's mvnmle:
-        - μ = sample mean
-        - Σ = sample covariance (regularized if needed)
-        """
-        # Regularize covariance if needed
-        eigenvals = np.linalg.eigvalsh(sample_cov)
-        if np.min(eigenvals) < 1e-6:
-            sample_cov = sample_cov + (1e-6 - np.min(eigenvals) + 1e-8) * np.eye(self.n_vars)
-        
-        # Pack into parameters
-        return self.pack(sample_mean, sample_cov)
 
 
 class CholeskyParameterization(CovarianceParameterization):
     """
     Standard Cholesky parameterization.
     
-    This parameterization uses L where Σ = LL'.
-    Parameters: θ = [μ, log(diag(L)), off-diag(L)]
+    Parameters: [μ, log(diag(L)), off-diag(L)]
+    where Σ = LL^T and L is lower triangular.
     
-    Used for GPU backends as it's more natural for autodiff.
-    More numerically stable with FP32 precision.
+    More natural for autodiff and GPU computation.
     """
     
     def pack(self, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:
-        """
-        Pack using standard Cholesky parameterization.
+        """Pack using Cholesky decomposition."""
+        L = np.linalg.cholesky(sigma)
         
-        Parameters
-        ----------
-        mu : np.ndarray, shape (n_vars,)
-            Mean vector
-        sigma : np.ndarray, shape (n_vars, n_vars)
-            Covariance matrix
-            
-        Returns
-        -------
-        theta : np.ndarray
-            Parameter vector [μ, log(diag(L)), off-diag(L)]
-        """
-        n = self.n_vars
+        # Log of diagonal for unconstrained optimization
+        log_diag = np.log(np.diag(L))
         
-        # Compute Cholesky decomposition: Σ = LL'
-        L = np.linalg.cholesky(sigma)  # Lower triangular
+        # Extract lower triangular elements
+        tril_idx = np.tril_indices(self.n_vars, k=-1)
+        tril_elements = L[tril_idx]
         
-        # Extract parameters
-        theta = np.zeros(self.n_params)
-        
-        # Mean parameters
-        theta[:n] = mu
-        
-        # Log diagonal elements of L
-        theta[n:2*n] = np.log(np.diag(L))
-        
-        # Off-diagonal elements (lower triangular, by column)
-        idx = 2 * n
-        for j in range(n):
-            for i in range(j + 1, n):
-                theta[idx] = L[i, j]
-                idx += 1
-        
-        return theta
+        return np.concatenate([mu, log_diag, tril_elements])
     
     def unpack(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Unpack from Cholesky parameters."""
+        mu = theta[:self.n_vars]
+        
+        # Reconstruct L matrix
+        L = np.zeros((self.n_vars, self.n_vars))
+        
+        # Diagonal elements
+        np.fill_diagonal(L, np.exp(theta[self.n_vars:2*self.n_vars]))
+        
+        # Off-diagonal elements
+        idx = 2 * self.n_vars
+        tril_idx = np.tril_indices(self.n_vars, k=-1)
+        if len(tril_idx[0]) > 0:
+            L[tril_idx] = theta[idx:]
+        
+        # Compute Σ = LL^T
+        sigma = L @ L.T
+        
+        return mu, sigma
+
+
+class BoundedCholeskyParameterization(CovarianceParameterization):
+    """
+    Bounded Cholesky parameterization for FP32 stability.
+    
+    Uses sigmoid/tanh transformations to naturally bound parameters:
+    - Diagonal elements bounded to [var_min, var_max]
+    - Off-diagonal elements bounded to prevent ill-conditioning
+    
+    Essential for FP32 GPU optimization to prevent numerical explosion.
+    """
+    
+    def __init__(self, n_vars: int,
+                 var_min: float = 0.001,
+                 var_max: float = 100.0,
+                 corr_max: float = 0.95):
         """
-        Unpack from standard Cholesky parameterization.
+        Initialize bounded parameterization.
         
         Parameters
         ----------
-        theta : np.ndarray
-            Parameter vector [μ, log(diag(L)), off-diag(L)]
-            
-        Returns
-        -------
-        mu : np.ndarray, shape (n_vars,)
-            Mean vector
-        sigma : np.ndarray, shape (n_vars, n_vars)
-            Covariance matrix
+        n_vars : int
+            Number of variables
+        var_min : float
+            Minimum variance
+        var_max : float
+            Maximum variance
+        corr_max : float
+            Maximum absolute correlation
         """
-        n = self.n_vars
+        super().__init__(n_vars)
+        self.var_min = var_min
+        self.var_max = var_max
+        self.corr_max = corr_max
+    
+    def _sigmoid(self, x: np.ndarray, low: float, high: float) -> np.ndarray:
+        """Map R to [low, high] using sigmoid."""
+        return low + (high - low) / (1 + np.exp(-x))
+    
+    def _inverse_sigmoid(self, y: np.ndarray, low: float, high: float) -> np.ndarray:
+        """Inverse sigmoid transformation."""
+        # Clip to avoid log(0)
+        y_clipped = np.clip((y - low) / (high - low), 1e-10, 1 - 1e-10)
+        return np.log(y_clipped / (1 - y_clipped))
+    
+    def pack(self, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:
+        """Pack with inverse transformations."""
+        L = np.linalg.cholesky(sigma)
         
-        # Extract mean
-        mu = theta[:n].copy()
+        # Transform diagonal to unbounded
+        diag_vals = np.diag(L) ** 2  # Variances
+        diag_vals = np.clip(diag_vals, self.var_min, self.var_max)
+        diag_unbounded = self._inverse_sigmoid(diag_vals, self.var_min, self.var_max)
         
-        # Reconstruct L matrix (lower triangular)
-        L = np.zeros((n, n))
+        # Transform off-diagonal to unbounded
+        tril_idx = np.tril_indices(self.n_vars, k=-1)
+        if len(tril_idx[0]) > 0:
+            L_tril = L[tril_idx]
+            # Normalize by sqrt of diagonal products (correlation scale)
+            i, j = tril_idx
+            normalizer = np.sqrt(L[i, i] * L[j, j])
+            corr_vals = np.clip(L_tril / normalizer, -self.corr_max * 0.999, self.corr_max * 0.999)
+            tril_unbounded = np.arctanh(corr_vals / self.corr_max)
+        else:
+            tril_unbounded = np.array([])
         
-        # Diagonal elements (exponentiated)
-        np.fill_diagonal(L, np.exp(theta[n:2*n]))
+        return np.concatenate([mu, diag_unbounded, tril_unbounded])
+    
+    def unpack(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Unpack with forward transformations."""
+        mu = theta[:self.n_vars]
         
-        # Off-diagonal elements
-        idx = 2 * n
-        for j in range(n):
-            for i in range(j + 1, n):
-                L[i, j] = theta[idx]
-                idx += 1
+        # Reconstruct L matrix
+        L = np.zeros((self.n_vars, self.n_vars))
         
-        # Compute Σ = LL'
+        # Diagonal: transform from unbounded to [var_min, var_max]
+        diag_unbounded = theta[self.n_vars:2*self.n_vars]
+        diag_vars = self._sigmoid(diag_unbounded, self.var_min, self.var_max)
+        np.fill_diagonal(L, np.sqrt(diag_vars))
+        
+        # Off-diagonal: transform from unbounded to bounded
+        idx = 2 * self.n_vars
+        tril_idx = np.tril_indices(self.n_vars, k=-1)
+        if len(tril_idx[0]) > 0:
+            tril_unbounded = theta[idx:]
+            corr_vals = self.corr_max * np.tanh(tril_unbounded)
+            
+            # Scale by diagonal
+            i, j = tril_idx
+            L[tril_idx] = corr_vals * np.sqrt(L[i, i] * L[j, j])
+        
+        # Compute Σ = LL^T
         sigma = L @ L.T
-        
-        # Ensure symmetry
-        sigma = 0.5 * (sigma + sigma.T)
         
         return mu, sigma
     
     def get_initial_parameters(self, sample_mean: np.ndarray,
                               sample_cov: np.ndarray) -> np.ndarray:
-        """
-        Get initial parameters for Cholesky parameterization.
+        """Get initial parameters with bounds enforced."""
+        # Clip eigenvalues to ensure bounds
+        eigvals, eigvecs = np.linalg.eigh(sample_cov)
+        eigvals = np.clip(eigvals, self.var_min, self.var_max)
+        bounded_cov = eigvecs @ np.diag(eigvals) @ eigvecs.T
         
-        Similar to R but using standard Cholesky.
-        """
-        # Regularize covariance if needed
-        eigenvals = np.linalg.eigvalsh(sample_cov)
-        if np.min(eigenvals) < 1e-6:
-            sample_cov = sample_cov + (1e-6 - np.min(eigenvals) + 1e-8) * np.eye(self.n_vars)
+        # Ensure correlations are within bounds
+        D = np.diag(1 / np.sqrt(np.diag(bounded_cov)))
+        corr_matrix = D @ bounded_cov @ D
+        corr_matrix = np.clip(corr_matrix, -self.corr_max, self.corr_max)
+        np.fill_diagonal(corr_matrix, 1.0)
         
-        # Pack into parameters
-        return self.pack(sample_mean, sample_cov)
+        # Reconstruct covariance
+        D_inv = np.diag(np.sqrt(np.diag(bounded_cov)))
+        bounded_cov = D_inv @ corr_matrix @ D_inv
+        
+        return self.pack(sample_mean, bounded_cov)
 
 
 class MatrixLogParameterization(CovarianceParameterization):
     """
     Matrix logarithm parameterization.
     
-    Uses Σ = exp(A) where A is symmetric.
-    This guarantees positive definiteness without Cholesky.
+    Parameters: [μ, vech(log(Σ))]
     
-    Experimental - may be useful for certain optimization landscapes.
+    Ensures positive definiteness but can be computationally expensive.
     """
     
     def pack(self, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:
-        """
-        Pack using matrix logarithm.
+        """Pack using matrix logarithm."""
+        from scipy.linalg import logm
         
-        Parameters
-        ----------
-        mu : np.ndarray, shape (n_vars,)
-            Mean vector
-        sigma : np.ndarray, shape (n_vars, n_vars)
-            Covariance matrix
-            
-        Returns
-        -------
-        theta : np.ndarray
-            Parameter vector [μ, vech(log(Σ))]
-        """
-        n = self.n_vars
+        log_sigma = logm(sigma)
         
-        # Compute matrix logarithm
-        eigenvals, eigenvecs = np.linalg.eigh(sigma)
-        log_eigenvals = np.log(eigenvals)
-        log_sigma = eigenvecs @ np.diag(log_eigenvals) @ eigenvecs.T
+        # Extract lower triangular part (including diagonal)
+        tril_idx = np.tril_indices(self.n_vars)
+        log_sigma_vec = log_sigma[tril_idx]
         
-        # Extract parameters
-        theta = np.zeros(self.n_params)
-        
-        # Mean parameters
-        theta[:n] = mu
-        
-        # Vectorize lower triangle of log(Σ)
-        idx = n
-        for i in range(n):
-            for j in range(i + 1):
-                theta[idx] = log_sigma[i, j]
-                idx += 1
-        
-        return theta
+        return np.concatenate([mu, log_sigma_vec])
     
     def unpack(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Unpack from matrix logarithm parameterization.
+        """Unpack using matrix exponential."""
+        from scipy.linalg import expm
         
-        Parameters
-        ----------
-        theta : np.ndarray
-            Parameter vector [μ, vech(log(Σ))]
-            
-        Returns
-        -------
-        mu : np.ndarray, shape (n_vars,)
-            Mean vector
-        sigma : np.ndarray, shape (n_vars, n_vars)
-            Covariance matrix
-        """
-        n = self.n_vars
+        mu = theta[:self.n_vars]
         
-        # Extract mean
-        mu = theta[:n].copy()
+        # Reconstruct symmetric log matrix
+        log_sigma = np.zeros((self.n_vars, self.n_vars))
+        tril_idx = np.tril_indices(self.n_vars)
+        log_sigma[tril_idx] = theta[self.n_vars:]
+        log_sigma = log_sigma + log_sigma.T - np.diag(np.diag(log_sigma))
         
-        # Reconstruct log(Σ)
-        log_sigma = np.zeros((n, n))
-        idx = n
-        for i in range(n):
-            for j in range(i + 1):
-                log_sigma[i, j] = theta[idx]
-                log_sigma[j, i] = theta[idx]  # Symmetric
-                idx += 1
-        
-        # Compute Σ = exp(log_sigma)
-        eigenvals, eigenvecs = np.linalg.eigh(log_sigma)
-        exp_eigenvals = np.exp(eigenvals)
-        sigma = eigenvecs @ np.diag(exp_eigenvals) @ eigenvecs.T
-        
-        # Ensure symmetry
-        sigma = 0.5 * (sigma + sigma.T)
+        # Matrix exponential
+        sigma = expm(log_sigma)
         
         return mu, sigma
+
+
+def get_parameterization(name: str, n_vars: int, **kwargs) -> CovarianceParameterization:
+    """
+    Factory function for parameterizations.
     
-    def get_initial_parameters(self, sample_mean: np.ndarray,
-                              sample_cov: np.ndarray) -> np.ndarray:
-        """Get initial parameters for matrix log parameterization."""
-        # Regularize if needed
-        eigenvals = np.linalg.eigvalsh(sample_cov)
-        if np.min(eigenvals) < 1e-6:
-            sample_cov = sample_cov + (1e-6 - np.min(eigenvals) + 1e-8) * np.eye(self.n_vars)
+    Parameters
+    ----------
+    name : str
+        Parameterization name: 'inverse_cholesky', 'cholesky', 'bounded_cholesky', 'matrix_log'
+    n_vars : int
+        Number of variables
+    **kwargs
+        Additional arguments for specific parameterizations
         
-        return self.pack(sample_mean, sample_cov)
+    Returns
+    -------
+    CovarianceParameterization
+        Parameterization instance
+    """
+    if name == 'inverse_cholesky':
+        return InverseCholeskyParameterization(n_vars)
+    elif name == 'cholesky':
+        return CholeskyParameterization(n_vars)
+    elif name == 'bounded_cholesky':
+        return BoundedCholeskyParameterization(n_vars, **kwargs)
+    elif name == 'matrix_log':
+        return MatrixLogParameterization(n_vars)
+    else:
+        raise ValueError(f"Unknown parameterization: {name}")
 
 
 def convert_parameters(theta: np.ndarray,
                       from_param: CovarianceParameterization,
                       to_param: CovarianceParameterization) -> np.ndarray:
     """
-    Convert parameters between different parameterizations.
+    Convert parameters between parameterizations.
     
     Parameters
     ----------
@@ -430,42 +359,8 @@ def convert_parameters(theta: np.ndarray,
         
     Returns
     -------
-    theta_new : np.ndarray
+    np.ndarray
         Parameter vector in target parameterization
     """
-    # Unpack using source parameterization
     mu, sigma = from_param.unpack(theta)
-    
-    # Pack using target parameterization
     return to_param.pack(mu, sigma)
-
-
-def get_parameterization(name: str, n_vars: int) -> CovarianceParameterization:
-    """
-    Get parameterization by name.
-    
-    Parameters
-    ----------
-    name : str
-        Parameterization name: 'inverse_cholesky', 'cholesky', or 'matrix_log'
-    n_vars : int
-        Number of variables
-        
-    Returns
-    -------
-    CovarianceParameterization
-        Parameterization instance
-    """
-    name = name.lower()
-    
-    if name in ['inverse_cholesky', 'inverse-cholesky', 'r', 'cpu']:
-        return InverseCholeskyParameterization(n_vars)
-    elif name in ['cholesky', 'standard', 'gpu']:
-        return CholeskyParameterization(n_vars)
-    elif name in ['matrix_log', 'matrix-log', 'log']:
-        return MatrixLogParameterization(n_vars)
-    else:
-        raise ValueError(
-            f"Unknown parameterization: {name}. "
-            f"Available: 'inverse_cholesky', 'cholesky', 'matrix_log'"
-        )

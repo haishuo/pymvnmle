@@ -9,7 +9,7 @@ import numpy as np
 import warnings
 from typing import Tuple, Optional, Dict, Any, Union
 from .base import MLEObjectiveBase, PatternData
-from .parameterizations import CholeskyParameterization
+from .parameterizations import CholeskyParameterization, BoundedCholeskyParameterization
 
 
 class GPUObjectiveFP32(MLEObjectiveBase):
@@ -30,7 +30,7 @@ class GPUObjectiveFP32(MLEObjectiveBase):
     def __init__(self, data: np.ndarray, 
                  device: Optional[str] = None,
                  validate: bool = True,
-                 compile_objective: bool = False):  # DISABLED due to trace issues
+                 use_bounded: bool = False):
         """
         Initialize GPU FP32 objective.
         
@@ -42,9 +42,8 @@ class GPUObjectiveFP32(MLEObjectiveBase):
             PyTorch device ('cuda', 'mps', or None for auto)
         validate : bool
             Whether to validate input data
-        compile_objective : bool
-            Whether to compile objective with torch.compile for speed
-            (DISABLED by default due to trace operation issues)
+        use_bounded : bool
+            Use bounded parameterization for FP32 stability
         """
         # Initialize base class (handles preprocessing)
         super().__init__(data, validate)
@@ -59,8 +58,11 @@ class GPUObjectiveFP32(MLEObjectiveBase):
                 "Install with: pip install torch"
             )
         
-        # Create parameterization (standard Cholesky for GPU)
-        self.parameterization = CholeskyParameterization(self.n_vars)
+        # Create parameterization
+        if use_bounded:
+            self.parameterization = BoundedCholeskyParameterization(self.n_vars)
+        else:
+            self.parameterization = CholeskyParameterization(self.n_vars)
         self.n_params = self.parameterization.n_params
         
         # Select device
@@ -72,14 +74,6 @@ class GPUObjectiveFP32(MLEObjectiveBase):
         
         # Transfer pattern data to GPU
         self._prepare_gpu_data()
-        
-        # Disable compilation due to trace backward issues
-        self.use_compiled = False
-        if compile_objective:
-            warnings.warn(
-                "torch.compile is disabled for GPU objectives due to trace operation compatibility issues",
-                RuntimeWarning
-            )
     
     def _select_device(self, requested_device: Optional[str]) -> Any:
         """Select appropriate GPU device."""
@@ -126,13 +120,6 @@ class GPUObjectiveFP32(MLEObjectiveBase):
                 gpu_pattern['n_observed'] = 0
             
             self.gpu_patterns.append(gpu_pattern)
-        
-        # Precompute constants on GPU
-        self.log_2pi_gpu = torch.tensor(
-            np.log(2 * np.pi), 
-            device=self.device, 
-            dtype=self.dtype
-        )
     
     def get_initial_parameters(self) -> np.ndarray:
         """
@@ -164,13 +151,11 @@ class GPUObjectiveFP32(MLEObjectiveBase):
         """
         torch = self.torch
         
-        # Convert to GPU tensor
+        # Convert to GPU tensor (no gradient needed for objective only)
         theta_gpu = torch.tensor(theta, device=self.device, dtype=self.dtype)
         
-        # Compute objective
-        if self.use_compiled:
-            obj_value = self._compiled_objective(theta_gpu)
-        else:
+        # Compute objective without gradient tracking
+        with torch.no_grad():
             obj_value = self._torch_objective(theta_gpu)
         
         # Return as Python float
@@ -203,10 +188,11 @@ class GPUObjectiveFP32(MLEObjectiveBase):
             if gpu_pattern['n_observed'] == 0:
                 continue
             
-            # Extract observed submatrices
+            # Extract observed submatrices - use index_select for gradient preservation
             obs_idx = gpu_pattern['observed_indices']
-            mu_k = mu_gpu[obs_idx]
-            sigma_k = sigma_gpu[obs_idx][:, obs_idx]
+            mu_k = torch.index_select(mu_gpu, 0, obs_idx)
+            sigma_k_rows = torch.index_select(sigma_gpu, 0, obs_idx)
+            sigma_k = torch.index_select(sigma_k_rows, 1, obs_idx)
             
             # Add small diagonal for FP32 stability
             sigma_k = sigma_k + self.eps * torch.eye(
@@ -216,8 +202,6 @@ class GPUObjectiveFP32(MLEObjectiveBase):
             )
             
             # Compute pattern contribution
-            # CRITICAL: This returns the TOTAL contribution for all n_obs in the pattern
-            # Do NOT multiply by n_obs again!
             contrib = self._compute_pattern_contribution_gpu(
                 gpu_pattern, mu_k, sigma_k
             )
@@ -253,47 +237,28 @@ class GPUObjectiveFP32(MLEObjectiveBase):
         torch = self.torch
         
         n_obs = pattern['n_obs']
-        n_obs_vars = pattern['n_observed']
-
-        # NO CONSTANT TERM! The CPU doesn't include n*p*log(2π)
-        # const_term = n_obs_vars * self.log_2pi_gpu  # REMOVED!
+        data = pattern['data']  # shape: (n_obs, n_observed)
         
         # Log determinant term: log|Σ_k|
-        try:
-            L_k = torch.linalg.cholesky(sigma_k)
-            log_det_term = 2.0 * torch.sum(torch.log(torch.diag(L_k)))
-        except:
-            # Fallback for near-singular matrices
-            eigenvals = torch.linalg.eigvalsh(sigma_k)
-            eigenvals = torch.clamp(eigenvals, min=self.eps)
-            log_det_term = torch.sum(torch.log(eigenvals))
+        L_k = torch.linalg.cholesky(sigma_k)
+        log_det_term = 2.0 * torch.sum(torch.log(torch.diag(L_k)))
         
-        # Compute sample covariance matrix
-        # S_k = (1/n) * Σᵢ (xᵢ - μ)(xᵢ - μ)ᵀ
-        data_centered = pattern['data'] - mu_k  # shape: (n_obs, n_observed)
-        S_k = (data_centered.T @ data_centered) / n_obs
+        # Center data and compute quadratic form
+        data_centered = data - mu_k.unsqueeze(0)  # Broadcasting
         
-        # Trace term: tr(Σ_k^-1 * S_k)
-        try:
-            # Solve Σ_k * X = S_k for X, then tr(X) = tr(Σ_k^-1 * S_k)
-            X = torch.linalg.solve(sigma_k, S_k)
-            trace_term = torch.trace(X)
-        except:
-            # Fallback using Cholesky solve
-            L_k = torch.linalg.cholesky(sigma_k)
-            Y = torch.linalg.solve_triangular(L_k, S_k, upper=False)
-            Z = torch.linalg.solve_triangular(L_k.T, Y, upper=True)
-            trace_term = torch.trace(Z)
+        # Compute quadratic form: sum_i (x_i - μ)^T Σ^{-1} (x_i - μ)
+        Y = torch.linalg.solve_triangular(L_k, data_centered.T, upper=False)
+        quad_form = torch.sum(Y * Y)  # ||Y||^2_F
         
-        # Total contribution: n_obs * [log|Σ| + tr(Σ^-1 S)]
+        # Total contribution: n_obs * log|Σ| + quad_form
         # NO CONSTANT TERM to match CPU!
-        total_contribution = n_obs * (log_det_term + trace_term)
+        total_contribution = n_obs * log_det_term + quad_form
 
         return total_contribution
     
     def _unpack_gpu(self, theta_gpu: Any) -> Tuple[Any, Any]:
         """
-        Unpack parameters on GPU.
+        Unpack parameters on GPU maintaining gradient flow.
         
         Parameters
         ----------
@@ -310,26 +275,50 @@ class GPUObjectiveFP32(MLEObjectiveBase):
         torch = self.torch
         n = self.n_vars
         
-        # Extract mean
+        # Extract mean directly
         mu = theta_gpu[:n]
         
-        # Reconstruct L matrix (lower triangular)
-        L = torch.zeros((n, n), device=self.device, dtype=self.dtype)
-        
-        # Diagonal elements (exponentiated)
-        L.diagonal().copy_(torch.exp(theta_gpu[n:2*n]))
-        
-        # Off-diagonal elements
-        idx = 2 * n
-        for j in range(n):
-            for i in range(j + 1, n):
-                L[i, j] = theta_gpu[idx]
-                idx += 1
+        # Build L matrix based on parameterization type
+        if isinstance(self.parameterization, BoundedCholeskyParameterization):
+            # Apply bounded transformations on GPU
+            L = torch.zeros((n, n), device=self.device, dtype=self.dtype)
+            
+            # Diagonal: sigmoid transformation
+            diag_unbounded = theta_gpu[n:2*n]
+            var_min = self.parameterization.var_min
+            var_max = self.parameterization.var_max
+            diag_vars = var_min + (var_max - var_min) * torch.sigmoid(diag_unbounded)
+            L = L + torch.diag(torch.sqrt(diag_vars))
+            
+            # Off-diagonal: tanh transformation  
+            idx = 2 * n
+            tril_indices = torch.tril_indices(n, n, offset=-1, device=self.device)
+            if len(tril_indices[0]) > 0:
+                tril_unbounded = theta_gpu[idx:]
+                corr_max = self.parameterization.corr_max
+                corr_vals = corr_max * torch.tanh(tril_unbounded)
+                
+                # Scale by diagonal
+                i, j = tril_indices
+                L[tril_indices[0], tril_indices[1]] = corr_vals * torch.sqrt(L[i, i] * L[j, j])
+        else:
+            # Standard Cholesky
+            L = torch.zeros((n, n), device=self.device, dtype=self.dtype)
+            
+            # Diagonal elements
+            L_diag = torch.exp(theta_gpu[n:2*n])
+            L = L + torch.diag(L_diag)
+            
+            # Off-diagonal elements
+            idx = 2 * n
+            tril_indices = torch.tril_indices(n, n, offset=-1, device=self.device)
+            if len(tril_indices[0]) > 0:
+                L[tril_indices[0], tril_indices[1]] = theta_gpu[idx:]
         
         # Compute Σ = LL'
-        sigma = L @ L.T
+        sigma = torch.matmul(L, L.T)
         
-        # Ensure symmetry (important for FP32)
+        # Ensure symmetry
         sigma = 0.5 * (sigma + sigma.T)
         
         return mu, sigma
@@ -358,14 +347,19 @@ class GPUObjectiveFP32(MLEObjectiveBase):
             requires_grad=True
         )
         
-        # Compute objective (never use compiled version for gradients)
+        # Compute objective WITH gradient tracking (no torch.no_grad!)
         obj_value = self._torch_objective(theta_gpu)
         
         # Compute gradient via autodiff
-        obj_value.backward()
+        grad_tensor = torch.autograd.grad(
+            outputs=obj_value,
+            inputs=theta_gpu,
+            create_graph=False,
+            retain_graph=False
+        )[0]
         
         # Return as NumPy array
-        return theta_gpu.grad.cpu().numpy()
+        return grad_tensor.cpu().numpy()
     
     def compute_hessian(self, theta: np.ndarray) -> np.ndarray:
         """
@@ -383,7 +377,7 @@ class GPUObjectiveFP32(MLEObjectiveBase):
         """
         raise NotImplementedError(
             "Hessian computation not implemented for FP32. "
-            "Use BFGS optimization which only requires gradients."
+            "Use BFGS or L-BFGS-B optimization which only requires gradients."
         )
     
     def extract_parameters(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
@@ -404,7 +398,7 @@ class GPUObjectiveFP32(MLEObjectiveBase):
         loglik : float
             Log-likelihood value
         """
-        # Unpack using CPU (for returning NumPy arrays)
+        # Unpack using parameterization
         mu, sigma = self.parameterization.unpack(theta)
         
         # Compute objective
@@ -412,6 +406,27 @@ class GPUObjectiveFP32(MLEObjectiveBase):
         loglik = -0.5 * neg2_loglik
         
         return mu, sigma, loglik
+    
+    def get_optimization_bounds(self):
+        """Get bounds if using bounded parameterization."""
+        if isinstance(self.parameterization, BoundedCholeskyParameterization):
+            # Return appropriate bounds for L-BFGS-B
+            bounds = []
+            n = self.n_vars
+            
+            # Mean parameters: unbounded
+            for i in range(n):
+                bounds.append((None, None))
+            
+            # Remaining parameters handled by bounded parameterization
+            # which uses sigmoid/tanh transformations internally
+            n_cov_params = self.n_params - n
+            for i in range(n_cov_params):
+                bounds.append((None, None))  # Unbounded in transformed space
+            
+            return bounds
+        else:
+            return None
     
     def check_convergence(self, theta: np.ndarray,
                          grad: Optional[np.ndarray] = None,
@@ -447,7 +462,7 @@ class GPUObjectiveFP32(MLEObjectiveBase):
         info = {
             'device': str(self.device),
             'dtype': 'float32',
-            'using_compiled': self.use_compiled
+            'parameterization': self.parameterization.__class__.__name__
         }
         
         if self.device.type == 'cuda':
@@ -465,16 +480,3 @@ class GPUObjectiveFP32(MLEObjectiveBase):
         """Clear GPU memory cache."""
         if self.device.type == 'cuda':
             self.torch.cuda.empty_cache()
-        # MPS doesn't have cache control
-    
-    def to_cpu(self) -> 'CPUObjectiveFP64':
-        """
-        Convert to CPU objective for comparison.
-        
-        Returns
-        -------
-        CPUObjectiveFP64
-            Equivalent CPU objective
-        """
-        from .cpu_fp64_objective import CPUObjectiveFP64
-        return CPUObjectiveFP64(self.original_data)

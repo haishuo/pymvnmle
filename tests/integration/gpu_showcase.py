@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-GPU Showcase Test - Demonstrates massive GPU speedup potential.
+GPU Showcase Test - Demonstrates GPU acceleration for missing data MLE.
 
-This test creates data specifically designed to showcase GPU strengths:
-- Large number of observations
-- Few patterns (ideally 1-3)
-- High-dimensional data
-- Large matrix operations that parallelize well
+This test creates optimal conditions for GPU performance and compares
+against CPU implementation using the mlest() API.
 """
 
 import numpy as np
@@ -14,9 +11,8 @@ import time
 import sys
 from pathlib import Path
 from typing import Dict, Any, Tuple
-import warnings
 
-# Add project root to path
+# Add project root
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from pymvnmle import mlest
@@ -24,9 +20,9 @@ from pymvnmle._objectives import get_objective
 
 
 def create_gpu_optimal_data(n_obs: int = 5000, 
-                           n_vars: int = 20,
-                           n_patterns: int = 3,
-                           seed: int = 42) -> Tuple[np.ndarray, Dict[str, Any]]:
+                            n_vars: int = 20,
+                            n_patterns: int = 3,
+                            seed: int = 42) -> Tuple[np.ndarray, Dict]:
     """
     Create data optimized for GPU performance.
     
@@ -59,10 +55,6 @@ def create_gpu_optimal_data(n_obs: int = 5000,
     data = np.random.multivariate_normal(true_mu, true_sigma, size=n_obs)
     
     # Create structured missing patterns
-    # Pattern 1: First 10% missing last variable
-    # Pattern 2: Next 10% missing first variable  
-    # Pattern 3: Rest complete (80% of data)
-    
     if n_patterns == 1:
         # Best case: all complete
         pass
@@ -111,10 +103,10 @@ def create_gpu_optimal_data(n_obs: int = 5000,
 
 
 def profile_gpu_vs_cpu(data: np.ndarray, 
-                       max_iter: int = 30,
+                       max_iter: int = 100,
                        verbose: bool = True) -> Dict[str, Any]:
     """
-    Profile GPU vs CPU performance on the data.
+    Profile GPU vs CPU using mlest().
     
     Parameters
     ----------
@@ -167,9 +159,9 @@ def profile_gpu_vs_cpu(data: np.ndarray,
               f"({100*np.sum(np.isnan(data))/data.size:.1f}%)")
         print("-" * 70)
     
-    # Create objectives
+    # Time component operations for diagnostics
     if verbose:
-        print("\nInitializing objectives...")
+        print("\nInitializing objectives for component timing...")
     
     start = time.perf_counter()
     cpu_obj = get_objective(data, backend='cpu')
@@ -192,7 +184,7 @@ def profile_gpu_vs_cpu(data: np.ndarray,
               f"max={max(pattern_sizes)}, "
               f"mean={np.mean(pattern_sizes):.0f}")
     
-    # Get initial parameters
+    # Get initial parameters for component timing
     theta = cpu_obj.get_initial_parameters()
     
     # Time objective computation
@@ -206,7 +198,6 @@ def profile_gpu_vs_cpu(data: np.ndarray,
         _ = cpu_obj.compute_objective(theta)
         times.append(time.perf_counter() - start)
     cpu_obj_time = np.mean(times[2:])  # Skip warmup
-    
     results['cpu_objective_time'] = cpu_obj_time
     
     if gpu_available:
@@ -232,7 +223,6 @@ def profile_gpu_vs_cpu(data: np.ndarray,
         _ = cpu_obj.compute_gradient(theta)
         times.append(time.perf_counter() - start)
     cpu_grad_time = np.mean(times[2:])  # Skip warmup
-    
     results['cpu_gradient_time'] = cpu_grad_time
     
     if gpu_available:
@@ -247,17 +237,17 @@ def profile_gpu_vs_cpu(data: np.ndarray,
         results['gpu_gradient_time'] = gpu_grad_time
         results['gradient_speedup'] = cpu_grad_time / gpu_grad_time
     
-    # Full optimization
+    # Full optimization using mlest()
     if verbose:
         print(f"\nRunning full optimization (max {max_iter} iterations)...")
         print("CPU optimization...")
     
+    # CPU optimization
     start = time.perf_counter()
-    cpu_result = mlest(data, method='BFGS', max_iter=max_iter, 
-                      backend='cpu', verbose=False)
-    cpu_total_time = time.perf_counter() - start
+    cpu_result = mlest(data, backend='cpu', max_iter=max_iter, verbose=False)
+    cpu_total = time.perf_counter() - start
     
-    results['cpu_total_time'] = cpu_total_time
+    results['cpu_total_time'] = cpu_total
     results['cpu_iterations'] = cpu_result.n_iter
     results['cpu_converged'] = cpu_result.converged
     
@@ -265,21 +255,19 @@ def profile_gpu_vs_cpu(data: np.ndarray,
         if verbose:
             print("GPU optimization...")
         
+        # GPU optimization
         start = time.perf_counter()
-        gpu_result = mlest(data, method='BFGS', max_iter=max_iter,
-                          backend='gpu', verbose=False)
-        gpu_total_time = time.perf_counter() - start
+        gpu_result = mlest(data, backend='gpu', max_iter=max_iter, verbose=False)
+        gpu_total = time.perf_counter() - start
         
-        results['gpu_total_time'] = gpu_total_time
+        results['gpu_total_time'] = gpu_total
         results['gpu_iterations'] = gpu_result.n_iter
         results['gpu_converged'] = gpu_result.converged
-        results['total_speedup'] = cpu_total_time / gpu_total_time
+        results['total_speedup'] = cpu_total / gpu_total
         
-        # Check accuracy
-        mu_diff = np.max(np.abs(cpu_result.muhat - gpu_result.muhat))
-        sigma_diff = np.max(np.abs(cpu_result.sigmahat - gpu_result.sigmahat))
-        results['mu_diff'] = mu_diff
-        results['sigma_diff'] = sigma_diff
+        # Compare accuracy
+        results['mu_diff'] = np.max(np.abs(cpu_result.muhat - gpu_result.muhat))
+        results['sigma_diff'] = np.max(np.abs(cpu_result.sigmahat - gpu_result.sigmahat))
     
     return results
 
@@ -318,7 +306,7 @@ def print_results(results: Dict[str, Any], data_info: Dict[str, Any]):
     print(f"    GPU: {results['gpu_gradient_time']*1000:.2f} ms")
     print(f"    Speedup: {results['gradient_speedup']:.2f}x")
     
-    print(f"\nFull Optimization:")
+    print(f"\nFull Optimization (via mlest):")
     print(f"  CPU: {results['cpu_total_time']:.2f}s ({results['cpu_iterations']} iter)")
     print(f"  GPU: {results['gpu_total_time']:.2f}s ({results['gpu_iterations']} iter)")
     print(f"  SPEEDUP: {results['total_speedup']:.2f}x")
@@ -335,6 +323,9 @@ def print_results(results: Dict[str, Any], data_info: Dict[str, Any]):
     print(f"\nAccuracy:")
     print(f"  Max μ difference: {results['mu_diff']:.2e}")
     print(f"  Max Σ difference: {results['sigma_diff']:.2e}")
+    
+    if results['sigma_diff'] > 1.0:
+        print(f"  ⚠️ WARNING: Large Σ difference may indicate convergence issues")
 
 
 def main():
@@ -343,46 +334,18 @@ def main():
     print("GPU SHOWCASE TEST")
     print("=" * 70)
     
-    # Test configurations optimized for GPU
+    # Test configurations
     test_configs = [
-        # Config 1: Moderate size, few patterns (good GPU case)
-        {
-            'name': 'Moderate (2000×15, 3 patterns)',
-            'n_obs': 2000,
-            'n_vars': 15,
-            'n_patterns': 3,
-            'max_iter': 30
-        },
-        
-        # Config 2: Large size, minimal patterns (ideal GPU case)
-        {
-            'name': 'Large (5000×20, 2 patterns)',
-            'n_obs': 5000,
-            'n_vars': 20,
-            'n_patterns': 2,
-            'max_iter': 25
-        },
-        
-        # Config 3: Very large, single pattern (best GPU case)
-        {
-            'name': 'Very Large (10000×25, 1 pattern)',
-            'n_obs': 10000,
-            'n_vars': 25,
-            'n_patterns': 1,
-            'max_iter': 20
-        },
-        
-        # Config 4: Massive (if you have enough memory)
-        {
-            'name': 'Massive (20000×30, 2 patterns)',
-            'n_obs': 20000,
-            'n_vars': 30,
-            'n_patterns': 2,
-            'max_iter': 15
-        }
+        {'name': 'Moderate (2000×15, 3 patterns)', 
+         'n_obs': 2000, 'n_vars': 15, 'n_patterns': 3, 'max_iter': 100},
+        {'name': 'Large (5000×20, 2 patterns)', 
+         'n_obs': 5000, 'n_vars': 20, 'n_patterns': 2, 'max_iter': 100},
+        {'name': 'Very Large (10000×25, 1 pattern)', 
+         'n_obs': 10000, 'n_vars': 25, 'n_patterns': 1, 'max_iter': 50},
+        {'name': 'Massive (20000×30, 2 patterns)', 
+         'n_obs': 20000, 'n_vars': 30, 'n_patterns': 2, 'max_iter': 30}
     ]
     
-    # Let user choose
     print("\nAvailable test configurations:")
     for i, config in enumerate(test_configs, 1):
         print(f"{i}. {config['name']}")
@@ -393,15 +356,15 @@ def main():
         choice = int(choice)
     except (ValueError, KeyboardInterrupt):
         print("\nUsing default configuration...")
-        choice = 2
+        choice = 1
     
     if choice == len(test_configs) + 1:
         configs_to_run = test_configs
     elif 1 <= choice <= len(test_configs):
         configs_to_run = [test_configs[choice-1]]
     else:
-        print(f"Invalid choice, using configuration 2...")
-        configs_to_run = [test_configs[1]]
+        print(f"Invalid choice, using configuration 1...")
+        configs_to_run = [test_configs[0]]
     
     # Run selected configurations
     for config in configs_to_run:
@@ -417,7 +380,7 @@ def main():
             n_patterns=config['n_patterns']
         )
         
-        # Profile
+        # Profile using mlest
         results = profile_gpu_vs_cpu(
             data, 
             max_iter=config['max_iter'],

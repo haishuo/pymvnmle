@@ -52,9 +52,47 @@ def _backend_method_selection(
     tuple
         (selected_backend, selected_method, backend_obj)
     """
-    # Normalize backend request
-    backend_lower = backend.lower() if backend else 'auto'
+    # Use the existing backend infrastructure!
+    try:
+        backend_obj = get_backend(backend=backend, use_fp64=gpu64)
+        
+        # Get backend info
+        backend_info = backend_obj.get_info() if hasattr(backend_obj, 'get_info') else {}
+        selected_backend = backend_info.get('backend_name', 'cpu')
+        
+        # Determine precision from backend
+        precision = backend_info.get('precision', 'fp64')
+        
+    except Exception as e:
+        if verbose:
+            print(f"Backend selection failed: {e}, falling back to CPU")
+        # Fallback to CPU
+        backend_obj = get_backend('cpu')
+        backend_info = backend_obj.get_info() if hasattr(backend_obj, 'get_info') else {}
+        selected_backend = 'cpu'
+        precision = 'fp64'
     
+    # Method selection based on backend and precision
+    method_upper = method.upper() if method else 'AUTO'
+    
+    if method_upper == 'AUTO':
+        # Auto-select method based on backend
+        if hasattr(backend_obj, 'optimization_method'):
+            selected_method = backend_obj.optimization_method
+        else:
+            selected_method = 'BFGS'  # Default
+    else:
+        selected_method = method
+    
+    if verbose:
+        if hasattr(backend_obj, 'get_device_info'):
+            device_info = backend_obj.get_device_info()
+            print(f"Backend: {device_info.get('backend_name', 'unknown')}")
+            print(f"Device: {device_info.get('device_type', 'unknown')}")
+            print(f"Precision: {device_info.get('precision', 'unknown')}")
+        print(f"Selected method: {selected_method}")
+    
+    return selected_backend, selected_method, backend_obj
     # Backend selection
     if backend_lower in ['auto', 'cpu', 'numpy']:
         selected_backend = 'cpu'
@@ -177,13 +215,40 @@ def mlest(
         backend, method, gpu64, verbose
     )
     
-    # Step 4: Create objective function
+    # Step 4: Create objective function based on backend
     try:
-        # Import the objective we need
-        from pymvnmle._objectives.cpu_fp64_objective import CPUObjectiveFP64
+        # Determine which objective to use based on backend
+        backend_name = backend_obj.name if hasattr(backend_obj, 'name') else 'numpy_fp64'
         
-        # Create objective directly without extra arguments
+        if 'pytorch' in backend_name or 'gpu' in backend_name:
+            # GPU backend - determine precision
+            precision = backend_obj.precision if hasattr(backend_obj, 'precision') else 'fp32'
+            
+            if precision == 'fp64':
+                from pymvnmle._objectives.gpu_fp64_objective import GPUObjectiveFP64
+                objective = GPUObjectiveFP64(data)
+            else:
+                from pymvnmle._objectives.gpu_fp32_objective import GPUObjectiveFP32
+                objective = GPUObjectiveFP32(data)
+                
+            if verbose:
+                print(f"Using GPU objective with {precision} precision")
+                
+        else:
+            # CPU backend
+            from pymvnmle._objectives.cpu_fp64_objective import CPUObjectiveFP64
+            objective = CPUObjectiveFP64(data)
+            
+            if verbose:
+                print("Using CPU objective with fp64 precision")
+                
+    except ImportError as e:
+        # Fallback to CPU if GPU objective not available
+        if verbose:
+            print(f"GPU objective not available: {e}, falling back to CPU")
+        from pymvnmle._objectives.cpu_fp64_objective import CPUObjectiveFP64
         objective = CPUObjectiveFP64(data)
+        selected_backend = 'cpu'  # Update for result
     except Exception as e:
         raise RuntimeError(f"Failed to create objective: {e}")
     

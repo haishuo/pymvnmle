@@ -1,52 +1,65 @@
 """
 Base class for MLE objectives with shared preprocessing.
-All backend-specific implementations inherit from this.
+
+This module contains the data preprocessing logic that is common to all
+objective implementations, regardless of backend or parameterization.
+Implements R's mysort algorithm for pattern grouping.
 """
 
 import numpy as np
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass
+from abc import ABC, abstractmethod
 
 
 @dataclass
 class PatternData:
     """
-    R-compatible pattern data structure.
+    Data structure for a missingness pattern group.
+    
+    This matches R's pattern grouping structure exactly.
     
     Attributes
     ----------
+    pattern_id : int
+        Unique identifier for this pattern
     observed_indices : np.ndarray
         Indices of observed variables for this pattern
-    n_k : int
+    missing_indices : np.ndarray
+        Indices of missing variables for this pattern
+    n_obs : int
         Number of observations with this pattern
-    data_k : np.ndarray
-        Data subset for this pattern (n_k × |observed_indices|)
+    data : np.ndarray
+        Data subset for this pattern (n_obs × n_observed)
     pattern_start : int
         Start index in sorted data
     pattern_end : int
-        End index in sorted data
+        End index in sorted data (exclusive)
     """
+    pattern_id: int
     observed_indices: np.ndarray
-    n_k: int
-    data_k: np.ndarray
-    pattern_start: int = 0
-    pattern_end: int = 0
+    missing_indices: np.ndarray
+    n_obs: int
+    data: np.ndarray
+    pattern_start: int
+    pattern_end: int
 
 
-class MLEObjectiveBase:
+class MLEObjectiveBase(ABC):
     """
-    Base class containing shared preprocessing for all objective implementations.
+    Base class for MLE objectives with shared preprocessing.
     
     This class handles:
-    1. Data preprocessing with R's mysort algorithm
-    2. Pattern extraction and organization
+    1. Data validation and preprocessing
+    2. R's mysort algorithm for pattern grouping
     3. Initial parameter computation
+    4. Pattern data extraction
     
-    All operations here use NumPy since preprocessing is always done on CPU
-    regardless of the computational backend used for optimization.
+    All operations here use NumPy since preprocessing is always
+    done on CPU regardless of the computational backend.
     """
     
-    def __init__(self, data: np.ndarray):
+    def __init__(self, data: np.ndarray, validate: bool = True):
         """
         Initialize with data preprocessing.
         
@@ -54,201 +67,346 @@ class MLEObjectiveBase:
         ----------
         data : np.ndarray, shape (n_obs, n_vars)
             Input data matrix with missing values as np.nan
+        validate : bool
+            Whether to validate input data
         """
-        # Store data dimensions
+        if validate:
+            self._validate_input(data)
+        
+        # Store dimensions
         self.n_obs, self.n_vars = data.shape
         self.original_data = np.asarray(data, dtype=np.float64)
         
-        # Apply R's mysort preprocessing
-        self.sorted_data, self.pattern_frequencies, self.presence_absence = self._mysort_preprocessing()
+        # Check for complete data (no missing values)
+        self.is_complete = not np.any(np.isnan(self.original_data))
+        
+        if self.is_complete:
+            # Complete data - no pattern grouping needed
+            self._handle_complete_data()
+        else:
+            # Apply R's mysort preprocessing
+            self._apply_mysort()
         
         # Extract pattern information
-        self.patterns = self._extract_pattern_data()
+        self.patterns = self._extract_patterns()
         self.n_patterns = len(self.patterns)
         
-        # Parameter structure: θ = [μ, log(diag(Δ)), upper(Δ)]
-        self.n_params = self.n_vars + (self.n_vars * (self.n_vars + 1)) // 2
+        # Compute initial parameters
+        self._compute_initial_statistics()
     
-    def _mysort_preprocessing(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _validate_input(self, data: np.ndarray) -> None:
         """
-        Sort data by missingness patterns (R's mysort algorithm).
+        Validate input data.
         
-        This groups observations with identical missingness patterns together
-        for efficient likelihood computation.
+        Parameters
+        ----------
+        data : np.ndarray
+            Input data to validate
+            
+        Raises
+        ------
+        ValueError
+            If data is invalid
+        """
+        if not isinstance(data, np.ndarray):
+            raise ValueError("Data must be a numpy array")
+        
+        if data.ndim != 2:
+            raise ValueError(f"Data must be 2D, got shape {data.shape}")
+        
+        if data.shape[0] < 2:
+            raise ValueError(f"Need at least 2 observations, got {data.shape[0]}")
+        
+        if data.shape[1] < 1:
+            raise ValueError(f"Need at least 1 variable, got {data.shape[1]}")
+        
+        # Check for all missing patterns
+        if np.all(np.isnan(data)):
+            raise ValueError("All data values are missing")
+        
+        # Check for variables with no observed values
+        for j in range(data.shape[1]):
+            if np.all(np.isnan(data[:, j])):
+                raise ValueError(f"Variable {j} has no observed values")
+    
+    def _handle_complete_data(self) -> None:
+        """Handle special case of complete data (no missing values)."""
+        self.sorted_data = self.original_data.copy()
+        self.pattern_assignments = np.zeros(self.n_obs, dtype=np.int32)
+        self.pattern_counts = np.array([self.n_obs], dtype=np.int32)
+        self.unique_patterns = np.ones((1, self.n_vars), dtype=bool)
+    
+    def _apply_mysort(self) -> None:
+        """
+        Apply R's mysort algorithm to group observations by missingness pattern.
+        
+        This sorts the data so that observations with the same missingness
+        pattern are contiguous, enabling efficient likelihood computation.
+        """
+        # Create binary missingness indicators (1 = observed, 0 = missing)
+        missingness_matrix = ~np.isnan(self.original_data)
+        
+        # Convert each pattern to a unique identifier
+        # Using base-2 representation for uniqueness
+        pattern_ids = np.zeros(self.n_obs, dtype=np.int64)
+        for i in range(self.n_obs):
+            pattern_ids[i] = self._pattern_to_id(missingness_matrix[i])
+        
+        # Sort observations by pattern ID
+        sort_indices = np.argsort(pattern_ids)
+        self.sorted_data = self.original_data[sort_indices]
+        sorted_patterns = pattern_ids[sort_indices]
+        
+        # Find unique patterns and their counts
+        unique_patterns, pattern_starts, pattern_counts = np.unique(
+            sorted_patterns, 
+            return_index=True, 
+            return_counts=True
+        )
+        
+        # Store pattern information
+        self.pattern_assignments = np.zeros(self.n_obs, dtype=np.int32)
+        for i, (start, count) in enumerate(zip(pattern_starts, pattern_counts)):
+            self.pattern_assignments[start:start+count] = i
+        
+        self.pattern_counts = pattern_counts
+        
+        # Convert pattern IDs back to binary matrix
+        self.unique_patterns = np.zeros((len(unique_patterns), self.n_vars), dtype=bool)
+        for i, pattern_id in enumerate(unique_patterns):
+            self.unique_patterns[i] = self._id_to_pattern(pattern_id)
+    
+    def _pattern_to_id(self, pattern: np.ndarray) -> int:
+        """
+        Convert missingness pattern to unique integer ID.
+        
+        Parameters
+        ----------
+        pattern : np.ndarray, shape (n_vars,)
+            Binary pattern (True = observed, False = missing)
+            
+        Returns
+        -------
+        int
+            Unique pattern identifier
+        """
+        # Use base-2 representation
+        result = 0
+        for i, val in enumerate(pattern):
+            if val:
+                result += 2**i
+        return result
+    
+    def _id_to_pattern(self, pattern_id: int) -> np.ndarray:
+        """
+        Convert pattern ID back to binary pattern.
+        
+        Parameters
+        ----------
+        pattern_id : int
+            Pattern identifier
+            
+        Returns
+        -------
+        np.ndarray, shape (n_vars,)
+            Binary pattern (True = observed, False = missing)
+        """
+        pattern = np.zeros(self.n_vars, dtype=bool)
+        for i in range(self.n_vars):
+            if pattern_id & (2**i):
+                pattern[i] = True
+        return pattern
+    
+    def _extract_patterns(self) -> List[PatternData]:
+        """
+        Extract pattern data structures from sorted data.
         
         Returns
         -------
-        sorted_data : np.ndarray
-            Data matrix with rows reordered by pattern
-        frequencies : np.ndarray
-            Number of observations in each pattern
-        presence_absence : np.ndarray
-            Binary matrix of observed variables per pattern
-        """
-        # Create binary representation (1=observed, 0=missing)
-        is_observed = (~np.isnan(self.original_data)).astype(int)
-        
-        # Convert patterns to decimal for sorting
-        # R uses powers of 2 to create unique codes for each pattern
-        powers = 2 ** np.arange(self.n_vars - 1, -1, -1)
-        pattern_codes = is_observed @ powers
-        
-        # Sort by pattern code
-        sort_indices = np.argsort(pattern_codes)
-        sorted_data = self.original_data[sort_indices]
-        sorted_patterns = is_observed[sort_indices]
-        sorted_codes = pattern_codes[sort_indices]
-        
-        # Extract unique patterns and frequencies
-        unique_codes, frequencies = np.unique(sorted_codes, return_counts=True)
-        
-        # Build presence/absence matrix for unique patterns
-        presence_absence = []
-        current_code = -1
-        
-        for i, code in enumerate(sorted_codes):
-            if code != current_code:
-                presence_absence.append(sorted_patterns[i])
-                current_code = code
-        
-        presence_absence = np.array(presence_absence)
-        
-        return sorted_data, frequencies, presence_absence
-    
-    def _extract_pattern_data(self) -> List[PatternData]:
-        """
-        Extract pattern-specific data structures.
-        
-        Creates PatternData objects for each unique missingness pattern,
-        maintaining R's data organization for efficient computation.
-        
-        Returns
-        -------
-        patterns : List[PatternData]
-            List of pattern data structures
+        List[PatternData]
+            Pattern data for each unique missingness pattern
         """
         patterns = []
-        data_start = 0
         
-        for pattern_idx in range(len(self.pattern_frequencies)):
-            n_k = self.pattern_frequencies[pattern_idx]
-            data_end = data_start + n_k
-            
-            # Get observed variable indices for this pattern
-            pattern_vec = self.presence_absence[pattern_idx]
-            observed_indices = np.where(pattern_vec == 1)[0]
-            
-            # Skip patterns with no observed variables
-            if len(observed_indices) == 0:
-                data_start = data_end
-                continue
-            
-            # Extract data subset (only observed variables)
-            data_k = self.sorted_data[data_start:data_end][:, observed_indices]
-            
-            patterns.append(PatternData(
-                observed_indices=observed_indices,
-                n_k=n_k,
-                data_k=data_k,
-                pattern_start=data_start,
-                pattern_end=data_end
-            ))
-            
-            data_start = data_end
+        if self.is_complete:
+            # Single pattern for complete data
+            pattern = PatternData(
+                pattern_id=0,
+                observed_indices=np.arange(self.n_vars),
+                missing_indices=np.array([], dtype=np.int32),
+                n_obs=self.n_obs,
+                data=self.sorted_data,
+                pattern_start=0,
+                pattern_end=self.n_obs
+            )
+            patterns.append(pattern)
+        else:
+            # Extract each pattern
+            pattern_start = 0
+            for i, (pattern_mask, count) in enumerate(zip(self.unique_patterns, self.pattern_counts)):
+                pattern_end = pattern_start + count
+                
+                # Get observed/missing indices
+                observed_idx = np.where(pattern_mask)[0]
+                missing_idx = np.where(~pattern_mask)[0]
+                
+                # Extract data for this pattern (only observed columns)
+                pattern_data = self.sorted_data[pattern_start:pattern_end][:, observed_idx]
+                
+                pattern = PatternData(
+                    pattern_id=i,
+                    observed_indices=observed_idx,
+                    missing_indices=missing_idx,
+                    n_obs=count,
+                    data=pattern_data,
+                    pattern_start=pattern_start,
+                    pattern_end=pattern_end
+                )
+                patterns.append(pattern)
+                
+                pattern_start = pattern_end
         
         return patterns
     
-    def get_initial_parameters(self) -> np.ndarray:
+    def _compute_initial_statistics(self) -> None:
         """
-        Compute initial parameter estimates using R-compatible method.
+        Compute initial sample statistics for starting values.
         
-        Uses pairwise complete observations to compute starting covariance,
-        exactly matching R's getstartvals() function.
+        Uses pairwise complete observations for covariance estimation.
+        """
+        # Compute sample mean (using all available data per variable)
+        self.sample_mean = np.zeros(self.n_vars)
+        for j in range(self.n_vars):
+            col_data = self.original_data[:, j]
+            valid_data = col_data[~np.isnan(col_data)]
+            if len(valid_data) > 0:
+                self.sample_mean[j] = np.mean(valid_data)
+        
+        # Compute sample covariance (pairwise complete observations)
+        self.sample_cov = self._compute_pairwise_covariance()
+        
+        # Ensure positive definiteness
+        self.sample_cov = self._regularize_covariance(self.sample_cov)
+    
+    def _compute_pairwise_covariance(self) -> np.ndarray:
+        """
+        Compute covariance using pairwise complete observations.
         
         Returns
         -------
-        theta : np.ndarray
-            Initial parameter vector in R's format:
-            [μ₁, ..., μₚ, log(δ₁₁), ..., log(δₚₚ), δ₁₂, δ₁₃, δ₂₃, ...]
+        np.ndarray, shape (n_vars, n_vars)
+            Sample covariance matrix
         """
-        # Step 1: Compute sample means
-        mu_start = np.nanmean(self.original_data, axis=0)
-        mu_start[np.isnan(mu_start)] = 0.0  # Handle completely missing variables
-        
-        # Step 2: Compute pairwise complete sample covariance
-        cov_sample = np.zeros((self.n_vars, self.n_vars))
+        cov = np.zeros((self.n_vars, self.n_vars))
         
         for i in range(self.n_vars):
             for j in range(i, self.n_vars):
-                # Find pairwise complete observations
-                mask = ~(np.isnan(self.original_data[:, i]) | 
-                        np.isnan(self.original_data[:, j]))
-                n_complete = np.sum(mask)
+                # Find observations where both variables are observed
+                valid_mask = ~np.isnan(self.original_data[:, i]) & ~np.isnan(self.original_data[:, j])
                 
-                if n_complete > 1:
-                    if i == j:
-                        # Variance
-                        var_i = np.var(self.original_data[mask, i], ddof=1)
-                        cov_sample[i, i] = var_i if var_i > 1e-10 else 0.01
-                    else:
-                        # Covariance
-                        data_pair = self.original_data[mask][:, [i, j]]
-                        cov_ij = np.cov(data_pair.T, ddof=1)[0, 1]
-                        cov_sample[i, j] = cov_sample[j, i] = cov_ij
+                if np.sum(valid_mask) > 1:
+                    xi = self.original_data[valid_mask, i]
+                    xj = self.original_data[valid_mask, j]
+                    
+                    # Compute covariance
+                    cov_ij = np.cov(xi, xj)[0, 1] if i != j else np.var(xi)
+                    cov[i, j] = cov_ij
+                    cov[j, i] = cov_ij
                 else:
-                    # No pairwise complete observations
-                    cov_sample[i, j] = cov_sample[j, i] = 0.0
-                    if i == j:
-                        cov_sample[i, i] = 1.0  # Default variance
+                    # Not enough data - use identity
+                    cov[i, j] = 1.0 if i == j else 0.0
+                    cov[j, i] = cov[i, j]
         
-        # Step 3: Regularize to ensure positive definiteness
-        eigenvals, eigenvecs = np.linalg.eigh(cov_sample)
+        return cov
+    
+    def _regularize_covariance(self, cov: np.ndarray, min_eigenval: float = 1e-6) -> np.ndarray:
+        """
+        Regularize covariance matrix to ensure positive definiteness.
         
-        # Find smallest positive eigenvalue
-        pos_eigenvals = eigenvals[eigenvals > 0]
-        if len(pos_eigenvals) > 0:
-            min_pos_eigenval = np.min(pos_eigenvals)
-        else:
-            min_pos_eigenval = 0.01
+        Parameters
+        ----------
+        cov : np.ndarray, shape (n_vars, n_vars)
+            Covariance matrix
+        min_eigenval : float
+            Minimum eigenvalue to enforce
+            
+        Returns
+        -------
+        np.ndarray, shape (n_vars, n_vars)
+            Regularized positive definite covariance
+        """
+        # Eigendecomposition
+        eigenvals, eigenvecs = np.linalg.eigh(cov)
         
-        # Regularize with small positive value
-        eps = 1e-3 * min_pos_eigenval
-        regularized_eigenvals = np.maximum(eigenvals, eps)
+        # Regularize if needed
+        if np.min(eigenvals) < min_eigenval:
+            eigenvals = np.maximum(eigenvals, min_eigenval)
+            cov = eigenvecs @ np.diag(eigenvals) @ eigenvecs.T
+            
+            # Ensure symmetry
+            cov = 0.5 * (cov + cov.T)
         
-        # Reconstruct regularized covariance
-        cov_regularized = eigenvecs @ np.diag(regularized_eigenvals) @ eigenvecs.T
-        cov_regularized = (cov_regularized + cov_regularized.T) / 2  # Ensure symmetry
+        return cov
+    
+    def get_pattern_summary(self) -> Dict[str, Any]:
+        """
+        Get summary of missingness patterns.
         
-        # Step 4: Compute starting Delta via Cholesky
-        try:
-            # Cholesky decomposition: cov = L @ L.T
-            L = np.linalg.cholesky(cov_regularized)
-            # Delta is inverse of upper triangular Cholesky
-            Delta_start = np.linalg.solve(L.T, np.eye(self.n_vars))
-        except np.linalg.LinAlgError:
-            # Fallback to diagonal
-            Delta_start = np.diag(1.0 / np.sqrt(np.diag(cov_regularized)))
+        Returns
+        -------
+        dict
+            Pattern summary statistics
+        """
+        summary = {
+            'n_patterns': self.n_patterns,
+            'n_obs': self.n_obs,
+            'n_vars': self.n_vars,
+            'is_complete': self.is_complete,
+            'patterns': []
+        }
         
-        # Ensure positive diagonal
-        for i in range(self.n_vars):
-            if Delta_start[i, i] < 0:
-                Delta_start[i, :] *= -1
+        for pattern in self.patterns:
+            pattern_info = {
+                'pattern_id': pattern.pattern_id,
+                'n_obs': pattern.n_obs,
+                'n_observed': len(pattern.observed_indices),
+                'n_missing': len(pattern.missing_indices),
+                'observed_vars': pattern.observed_indices.tolist(),
+                'missing_vars': pattern.missing_indices.tolist(),
+                'proportion': pattern.n_obs / self.n_obs
+            }
+            summary['patterns'].append(pattern_info)
         
-        # Step 5: Pack into parameter vector
-        theta_init = np.zeros(self.n_params)
+        # Sort by frequency
+        summary['patterns'].sort(key=lambda x: x['n_obs'], reverse=True)
         
-        # Mean parameters
-        theta_init[:self.n_vars] = mu_start
+        return summary
+    
+    @abstractmethod
+    def compute_objective(self, theta: np.ndarray) -> float:
+        """
+        Compute objective function value.
         
-        # Log diagonal parameters
-        diag_vals = np.diag(Delta_start)
-        theta_init[self.n_vars:2*self.n_vars] = np.log(np.maximum(diag_vals, 1e-10))
+        Parameters
+        ----------
+        theta : np.ndarray
+            Parameter vector
+            
+        Returns
+        -------
+        float
+            Objective function value (-2 * log-likelihood)
+        """
+        raise NotImplementedError
+    
+    @abstractmethod
+    def get_initial_parameters(self) -> np.ndarray:
+        """
+        Get initial parameter values.
         
-        # Upper triangle parameters (column-major order)
-        idx = 2 * self.n_vars
-        for j in range(self.n_vars):
-            for i in range(j):
-                theta_init[idx] = Delta_start[i, j]
-                idx += 1
-        
-        return theta_init
+        Returns
+        -------
+        np.ndarray
+            Initial parameter vector
+        """
+        raise NotImplementedError

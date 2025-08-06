@@ -1,171 +1,217 @@
 #!/usr/bin/env python3
 """
-Debug pattern-by-pattern contributions to find the issue.
+Diagnose the Sigma accuracy problem between CPU and GPU objectives.
 """
 
 import numpy as np
-import torch
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-def debug_patterns():
-    """Debug each pattern's contribution."""
+from pymvnmle._objectives import get_objective
+from pymvnmle._objectives.parameterizations import (
+    InverseCholeskyParameterization,
+    CholeskyParameterization
+)
+
+
+def diagnose_sigma_issue():
+    """Diagnose why Sigma estimates differ between CPU and GPU."""
+    
     print("=" * 70)
-    print("PATTERN-BY-PATTERN DEBUG")
+    print("DIAGNOSING SIGMA ACCURACY ISSUE")
     print("=" * 70)
     
-    # Create data with missing values
+    # Create simple test data
     np.random.seed(42)
-    data = np.array([[1.0, 2.0, np.nan],
-                     [2.0, np.nan, 3.0],
-                     [3.0, 4.0, 5.0],
-                     [np.nan, 5.0, 6.0]])
+    n_obs, n_vars = 100, 5
     
-    print(f"Data:\n{data}")
+    # Known true parameters
+    true_mu = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    true_sigma = np.array([
+        [2.0, 0.5, 0.3, 0.2, 0.1],
+        [0.5, 3.0, 0.4, 0.3, 0.2],
+        [0.3, 0.4, 2.5, 0.5, 0.3],
+        [0.2, 0.3, 0.5, 2.0, 0.4],
+        [0.1, 0.2, 0.3, 0.4, 1.5]
+    ])
     
-    # Import objectives
-    from pymvnmle._objectives import get_objective
-    from pymvnmle._objectives.parameterizations import (
-        InverseCholeskyParameterization,
-        CholeskyParameterization
-    )
+    # Generate complete data (no missing values for simplicity)
+    data = np.random.multivariate_normal(true_mu, true_sigma, size=n_obs)
+    
+    print(f"\nTest setup:")
+    print(f"  Data: {n_obs}×{n_vars} (complete, no missing)")
+    print(f"  True μ: {true_mu}")
+    print(f"  True Σ diagonal: {np.diag(true_sigma)}")
     
     # Create objectives
     cpu_obj = get_objective(data, backend='cpu')
     gpu_obj = get_objective(data, backend='gpu', precision='fp32')
     
-    # Use same mu and sigma
-    mu = np.array([2.0, 3.0, 4.0])
-    sigma = np.array([[1.0, 0.3, 0.2],
-                      [0.3, 1.0, 0.4],
-                      [0.2, 0.4, 1.0]])
+    print(f"\nObjective types:")
+    print(f"  CPU: {type(cpu_obj).__name__}")
+    print(f"  GPU: {type(gpu_obj).__name__}")
     
-    print(f"\nμ = {mu}")
-    print(f"Σ = \n{sigma}")
+    # Create parameterizations
+    cpu_param = InverseCholeskyParameterization(n_vars)
+    gpu_param = CholeskyParameterization(n_vars)
     
-    # Pack parameters
-    cpu_param = InverseCholeskyParameterization(3)
-    gpu_param = CholeskyParameterization(3)
+    # Test 1: Check if we can round-trip the true parameters
+    print("\n" + "-" * 70)
+    print("TEST 1: Parameter round-trip with true values")
+    print("-" * 70)
     
-    theta_cpu = cpu_param.pack(mu, sigma)
-    theta_gpu = gpu_param.pack(mu, sigma)
+    # CPU parameterization
+    theta_cpu = cpu_param.pack(true_mu, true_sigma)
+    mu_cpu_unpack, sigma_cpu_unpack = cpu_param.unpack(theta_cpu)
     
-    # Manually compute each pattern's contribution
+    print(f"\nCPU (Inverse Cholesky):")
+    print(f"  θ length: {len(theta_cpu)}")
+    print(f"  μ error: {np.max(np.abs(mu_cpu_unpack - true_mu)):.2e}")
+    print(f"  Σ error: {np.max(np.abs(sigma_cpu_unpack - true_sigma)):.2e}")
+    
+    # GPU parameterization
+    theta_gpu = gpu_param.pack(true_mu, true_sigma)
+    mu_gpu_unpack, sigma_gpu_unpack = gpu_param.unpack(theta_gpu)
+    
+    print(f"\nGPU (Standard Cholesky):")
+    print(f"  θ length: {len(theta_gpu)}")
+    print(f"  μ error: {np.max(np.abs(mu_gpu_unpack - true_mu)):.2e}")
+    print(f"  Σ error: {np.max(np.abs(sigma_gpu_unpack - true_sigma)):.2e}")
+    
+    # Test 2: Check extract_parameters method
+    print("\n" + "-" * 70)
+    print("TEST 2: extract_parameters with true theta")
+    print("-" * 70)
+    
+    # CPU extract
+    mu_cpu_ext, sigma_cpu_ext, loglik_cpu = cpu_obj.extract_parameters(theta_cpu)
+    print(f"\nCPU extract_parameters:")
+    print(f"  μ error: {np.max(np.abs(mu_cpu_ext - true_mu)):.2e}")
+    print(f"  Σ error: {np.max(np.abs(sigma_cpu_ext - true_sigma)):.2e}")
+    print(f"  Log-likelihood: {loglik_cpu:.3f}")
+    
+    # GPU extract
+    mu_gpu_ext, sigma_gpu_ext, loglik_gpu = gpu_obj.extract_parameters(theta_gpu)
+    print(f"\nGPU extract_parameters:")
+    print(f"  μ error: {np.max(np.abs(mu_gpu_ext - true_mu)):.2e}")
+    print(f"  Σ error: {np.max(np.abs(sigma_gpu_ext - true_sigma)):.2e}")
+    print(f"  Log-likelihood: {loglik_gpu:.3f}")
+    
+    # Test 3: Check objectives at true parameters
+    print("\n" + "-" * 70)
+    print("TEST 3: Objective values at true parameters")
+    print("-" * 70)
+    
+    obj_cpu = cpu_obj.compute_objective(theta_cpu)
+    obj_gpu = gpu_obj.compute_objective(theta_gpu)
+    
+    print(f"\nObjective values (-2 * log-likelihood):")
+    print(f"  CPU: {obj_cpu:.6f}")
+    print(f"  GPU: {obj_gpu:.6f}")
+    print(f"  Difference: {abs(obj_cpu - obj_gpu):.6f}")
+    
+    # Test 4: Check gradients at true parameters
+    print("\n" + "-" * 70)
+    print("TEST 4: Gradients at true parameters")
+    print("-" * 70)
+    
+    grad_cpu = cpu_obj.compute_gradient(theta_cpu)
+    grad_gpu = gpu_obj.compute_gradient(theta_gpu)
+    
+    print(f"\nGradient norms:")
+    print(f"  CPU: {np.linalg.norm(grad_cpu):.6f}")
+    print(f"  GPU: {np.linalg.norm(grad_gpu):.6f}")
+    print(f"  Max gradient:")
+    print(f"    CPU: {np.max(np.abs(grad_cpu)):.6f}")
+    print(f"    GPU: {np.max(np.abs(grad_gpu)):.6f}")
+    
+    # Test 5: Run a few optimization steps
+    print("\n" + "-" * 70)
+    print("TEST 5: Run 5 optimization steps from initial parameters")
+    print("-" * 70)
+    
+    # Get initial parameters
+    theta0_cpu = cpu_obj.get_initial_parameters()
+    theta0_gpu = gpu_obj.get_initial_parameters()
+    
+    # Initial extract
+    mu0_cpu, sigma0_cpu, _ = cpu_obj.extract_parameters(theta0_cpu)
+    mu0_gpu, sigma0_gpu, _ = gpu_obj.extract_parameters(theta0_gpu)
+    
+    print(f"\nInitial parameters:")
+    print(f"  CPU μ[0]: {mu0_cpu[0]:.6f}")
+    print(f"  GPU μ[0]: {mu0_gpu[0]:.6f}")
+    print(f"  CPU Σ[0,0]: {sigma0_cpu[0,0]:.6f}")
+    print(f"  GPU Σ[0,0]: {sigma0_gpu[0,0]:.6f}")
+    
+    # Simple gradient descent
+    theta_cpu = theta0_cpu.copy()
+    theta_gpu = theta0_gpu.copy()
+    lr = 0.001
+    
+    for i in range(5):
+        # CPU step
+        grad_cpu = cpu_obj.compute_gradient(theta_cpu)
+        theta_cpu -= lr * grad_cpu
+        
+        # GPU step
+        grad_gpu = gpu_obj.compute_gradient(theta_gpu)
+        theta_gpu -= lr * grad_gpu
+        
+        # Extract and compare
+        mu_cpu, sigma_cpu, _ = cpu_obj.extract_parameters(theta_cpu)
+        mu_gpu, sigma_gpu, _ = gpu_obj.extract_parameters(theta_gpu)
+        
+        print(f"\nStep {i+1}:")
+        print(f"  CPU μ[0]: {mu_cpu[0]:.6f}, Σ[0,0]: {sigma_cpu[0,0]:.6f}")
+        print(f"  GPU μ[0]: {mu_gpu[0]:.6f}, Σ[0,0]: {sigma_gpu[0,0]:.6f}")
+        print(f"  μ diff: {np.max(np.abs(mu_cpu - mu_gpu)):.2e}")
+        print(f"  Σ diff: {np.max(np.abs(sigma_cpu - sigma_gpu)):.2e}")
+    
+    # Test 6: Check if parameterizations are equivalent
+    print("\n" + "-" * 70)
+    print("TEST 6: Cross-parameterization test")
+    print("-" * 70)
+    
+    # Take CPU's optimal mu and sigma, pack with GPU parameterization
+    mu_cpu_final, sigma_cpu_final, _ = cpu_obj.extract_parameters(theta_cpu)
+    theta_gpu_from_cpu = gpu_param.pack(mu_cpu_final, sigma_cpu_final)
+    mu_check, sigma_check = gpu_param.unpack(theta_gpu_from_cpu)
+    
+    print(f"\nCPU solution -> GPU parameterization -> unpack:")
+    print(f"  μ preserved: {np.max(np.abs(mu_check - mu_cpu_final)):.2e}")
+    print(f"  Σ preserved: {np.max(np.abs(sigma_check - sigma_cpu_final)):.2e}")
+    
+    # Compute objective with GPU using CPU's solution
+    obj_gpu_at_cpu_sol = gpu_obj.compute_objective(theta_gpu_from_cpu)
+    obj_cpu_at_cpu_sol = cpu_obj.compute_objective(theta_cpu)
+    
+    print(f"\nObjective at CPU solution:")
+    print(f"  CPU objective: {obj_cpu_at_cpu_sol:.6f}")
+    print(f"  GPU objective (CPU's solution): {obj_gpu_at_cpu_sol:.6f}")
+    print(f"  Difference: {abs(obj_cpu_at_cpu_sol - obj_gpu_at_cpu_sol):.6f}")
+    
     print("\n" + "=" * 70)
-    print("CPU PATTERNS")
+    print("DIAGNOSIS COMPLETE")
     print("=" * 70)
     
-    total_cpu = 0
-    for i, pattern in enumerate(cpu_obj.patterns):
-        print(f"\nPattern {i}:")
-        print(f"  N obs: {pattern.n_obs}")
-        print(f"  Observed indices: {pattern.observed_indices}")
-        
-        # Extract submatrices
-        obs_idx = pattern.observed_indices
-        mu_k = mu[obs_idx]
-        sigma_k = sigma[np.ix_(obs_idx, obs_idx)]
-        
-        print(f"  μ_k: {mu_k}")
-        print(f"  Σ_k shape: {sigma_k.shape}")
-        
-        # Compute contribution (R-style)
-        n_k = pattern.n_obs
-        p_k = len(obs_idx)
-        
-        const = p_k * np.log(2 * np.pi)
-        log_det = np.linalg.slogdet(sigma_k)[1]
-        
-        # Get pattern data
-        data_k = pattern.data
-        data_centered = data_k - mu_k
-        S_k = (data_centered.T @ data_centered) / n_k
-        
-        sigma_k_inv = np.linalg.inv(sigma_k)
-        trace_term = np.trace(sigma_k_inv @ S_k)
-        
-        contrib = n_k * (const + log_det + trace_term)
-        total_cpu += contrib
-        
-        print(f"  Contribution: {contrib:.6f}")
-        print(f"    Const: {n_k * const:.6f}")
-        print(f"    Log-det: {n_k * log_det:.6f}")
-        print(f"    Trace: {n_k * trace_term:.6f}")
+    print("\n🔍 KEY FINDINGS:")
+    if abs(obj_cpu_at_cpu_sol - obj_gpu_at_cpu_sol) > 0.01:
+        print("❌ GPU and CPU compute different objective values for same (μ,Σ)!")
+        print("   This indicates a bug in the objective computation.")
+    else:
+        print("✅ GPU and CPU compute same objective for same (μ,Σ)")
     
-    print(f"\nTotal CPU objective: {total_cpu:.6f}")
-    print(f"CPU compute_objective: {cpu_obj.compute_objective(theta_cpu):.6f}")
+    if np.max(np.abs(sigma_cpu - sigma_gpu)) > 0.01:
+        print("❌ GPU and CPU converge to different Σ values!")
+        print("   This could be due to different convergence criteria or numerical issues.")
     
-    # Now check GPU patterns
-    print("\n" + "=" * 70)
-    print("GPU PATTERNS")
-    print("=" * 70)
-    
-    # Convert to GPU
-    mu_gpu = torch.tensor(mu, dtype=torch.float32, device='cuda')
-    sigma_gpu = torch.tensor(sigma, dtype=torch.float32, device='cuda')
-    
-    total_gpu = 0
-    for i, pattern in enumerate(gpu_obj.gpu_patterns):
-        print(f"\nPattern {i}:")
-        print(f"  N obs: {pattern['n_obs']}")
-        print(f"  N observed vars: {pattern['n_observed']}")
-        
-        obs_idx = pattern['observed_indices']
-        mu_k = mu_gpu[obs_idx]
-        sigma_k = sigma_gpu[obs_idx][:, obs_idx]
-        
-        # Add small diagonal for stability
-        sigma_k = sigma_k + 1e-6 * torch.eye(pattern['n_observed'], device='cuda', dtype=torch.float32)
-        
-        n_k = pattern['n_obs']
-        p_k = pattern['n_observed']
-        
-        # Constants
-        const = p_k * np.log(2 * np.pi)
-        
-        # Log determinant
-        L_k = torch.linalg.cholesky(sigma_k)
-        log_det = 2 * torch.sum(torch.log(torch.diag(L_k)))
-        
-        # Sample covariance
-        data_centered = pattern['data'] - mu_k
-        S_k = (data_centered.T @ data_centered) / n_k
-        
-        # Trace term
-        X = torch.linalg.solve(sigma_k, S_k)
-        trace_term = torch.trace(X)
-        
-        # Total contribution
-        contrib = n_k * (const + log_det.item() + trace_term.item())
-        total_gpu += contrib
-        
-        print(f"  Contribution: {contrib:.6f}")
-        print(f"    Const: {n_k * const:.6f}")
-        print(f"    Log-det: {n_k * log_det.item():.6f}")
-        print(f"    Trace: {n_k * trace_term.item():.6f}")
-        
-        # Check if this matches the method
-        contrib_method = gpu_obj._compute_pattern_contribution_gpu(
-            pattern, mu_k, sigma_k - 1e-6 * torch.eye(pattern['n_observed'], device='cuda', dtype=torch.float32)
-        )
-        print(f"  Method contribution (per obs): {contrib_method.item():.6f}")
-        print(f"  Method * n_obs: {contrib_method.item() * n_k:.6f}")
-    
-    print(f"\nTotal GPU objective (manual): {total_gpu:.6f}")
-    print(f"Total GPU * 2 (R convention): {total_gpu * 2:.6f}")
-    print(f"GPU compute_objective: {gpu_obj.compute_objective(theta_gpu):.6f}")
-    
-    # Compare
-    print("\n" + "=" * 70)
-    print("COMPARISON")
-    print("=" * 70)
-    print(f"CPU total: {total_cpu:.6f}")
-    print(f"GPU total (manual): {total_gpu:.6f}")
-    print(f"GPU total * 2: {total_gpu * 2:.6f}")
-    print(f"Ratio GPU*2/CPU: {(total_gpu * 2) / total_cpu:.2f}")
+    if np.max(np.abs(sigma_check - sigma_cpu_final)) > 1e-10:
+        print("❌ Parameterization round-trip fails!")
+        print("   This indicates a bug in pack/unpack methods.")
 
 
 if __name__ == "__main__":
-    debug_patterns()
+    diagnose_sigma_issue()

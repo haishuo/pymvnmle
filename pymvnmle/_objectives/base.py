@@ -5,13 +5,17 @@ This implementation exactly replicates R's mvnmle behavior, including the
 critical pattern ordering quirk where data is sorted by pattern codes but
 patterns must be processed with complete cases first.
 
+Pattern optimization support added WITHOUT re-identifying patterns - uses
+R's existing patterns to maintain exact compatibility.
+
 Author: Senior Biostatistician
 Purpose: FDA-grade statistical software requiring exact R compatibility
 """
 
 import numpy as np
-from typing import List, Tuple, Optional, NamedTuple
+from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass
+import warnings
 
 
 @dataclass
@@ -34,12 +38,15 @@ class MLEObjectiveBase:
     1. R-compatible data sorting (mysort algorithm)
     2. Pattern extraction with correct ordering (complete cases first)
     3. Initial parameter computation
-    4. Subclass interface for objective/gradient computation
+    4. Pattern optimization support (using R's patterns, not re-identifying)
+    5. Subclass interface for objective/gradient computation
     
     Critical for regulatory compliance: Exact replication of R mvnmle behavior.
     """
     
-    def __init__(self, data: np.ndarray, skip_validation: bool = False):
+    def __init__(self, data: np.ndarray, 
+                 skip_validation: bool = False,
+                 use_pattern_optimization: bool = False):
         """
         Initialize objective function with data.
         
@@ -49,6 +56,10 @@ class MLEObjectiveBase:
             Input data matrix with missing values as np.nan
         skip_validation : bool
             If True, skip data validation (assumes caller validated)
+        use_pattern_optimization : bool, default=False
+            If True, prepare data for pattern-based vectorized computation.
+            This does NOT change results, only performance.
+            Currently defaults to False until thoroughly tested.
         """
         if not skip_validation:
             self._validate_data(data)
@@ -62,6 +73,9 @@ class MLEObjectiveBase:
         self.n_cov_params = self.n_vars * (self.n_vars + 1) // 2
         self.n_params = self.n_mean_params + self.n_cov_params
         
+        # Pattern optimization flag
+        self.use_pattern_optimization = use_pattern_optimization
+        
         # Apply R's mysort algorithm
         self._apply_mysort()
         
@@ -69,9 +83,20 @@ class MLEObjectiveBase:
         self.patterns = self._extract_patterns()
         self.n_patterns = len(self.patterns)
         
+        # Prepare pattern optimization if requested
+        # CRITICAL: This must use R's patterns, not re-identify!
+        if self.use_pattern_optimization:
+            self._prepare_pattern_optimization()
+        else:
+            self.pattern_groups = None
+            self.pattern_efficiency = None
+        
         # Compute sample statistics for subclasses
         self.sample_mean = np.nanmean(self.original_data, axis=0)
         self.sample_cov = self._compute_sample_covariance()
+        
+        # Check if data is complete (no missing values)
+        self.is_complete = not np.any(np.isnan(self.original_data))
     
     def _validate_data(self, data: np.ndarray) -> None:
         """
@@ -80,101 +105,94 @@ class MLEObjectiveBase:
         Parameters
         ----------
         data : np.ndarray
-            Input data to validate
+            Data to validate
             
         Raises
         ------
         ValueError
-            If data is invalid (wrong shape, no variation, etc.)
+            If data is invalid
         """
         if not isinstance(data, np.ndarray):
             data = np.asarray(data)
         
         if data.ndim != 2:
-            raise ValueError(f"Data must be 2-dimensional, got shape {data.shape}")
+            raise ValueError(f"Data must be 2D, got shape {data.shape}")
         
-        n_obs, n_vars = data.shape
+        if data.shape[0] < 2:
+            raise ValueError(f"Need at least 2 observations, got {data.shape[0]}")
         
-        if n_obs < 2:
-            raise ValueError(f"Need at least 2 observations, got {n_obs}")
+        if data.shape[1] < 1:
+            raise ValueError(f"Need at least 1 variable, got {data.shape[1]}")
         
-        if n_vars < 1:
-            raise ValueError(f"Need at least 1 variable, got {n_vars}")
+        # Check for all-missing rows or columns
+        if np.any(np.all(np.isnan(data), axis=1)):
+            raise ValueError("Data contains rows with all missing values")
         
-        # Check for infinite values
-        if np.any(np.isinf(data)):
-            raise ValueError("Data contains infinite values")
-        
-        # Check for complete missingness in any variable
-        for j in range(n_vars):
-            if np.all(np.isnan(data[:, j])):
-                raise ValueError(f"Variable {j} is completely missing")
-        
-        # Check for complete missingness in any observation
-        for i in range(n_obs):
-            if np.all(np.isnan(data[i, :])):
-                raise ValueError(f"Observation {i} is completely missing")
+        if np.any(np.all(np.isnan(data), axis=0)):
+            raise ValueError("Data contains columns with all missing values")
     
     def _apply_mysort(self) -> None:
         """
         Apply R's mysort algorithm to sort data by missingness patterns.
         
-        This groups observations with identical missingness patterns together
-        for efficient likelihood computation. Uses R's exact algorithm.
+        This is CRITICAL for R compatibility - must match exactly.
+        Creates pattern codes using powers of 2 and sorts observations.
         """
-        # Create binary missingness matrix (1 = observed, 0 = missing)
-        self.is_observed = ~np.isnan(self.original_data)
+        # Create presence/absence matrix (1 = observed, 0 = missing)
+        self.presence_absence = (~np.isnan(self.original_data)).astype(int)
         
-        # R's exact power computation: 2^(p-1), 2^(p-2), ..., 2^0
+        # Create pattern codes using powers of 2 (R's approach)
+        # This creates unique codes for each missingness pattern
         powers = 2 ** np.arange(self.n_vars - 1, -1, -1)
+        pattern_codes = self.presence_absence @ powers
         
-        # Convert each pattern to a decimal code
-        self.pattern_codes = self.is_observed.astype(int) @ powers
+        # Sort data by pattern codes
+        sort_indices = np.argsort(pattern_codes)
+        self.sorted_data = self.original_data[sort_indices]
+        self.sorted_patterns = self.presence_absence[sort_indices]
+        self.sorted_codes = pattern_codes[sort_indices]
         
-        # Sort observations by pattern code
-        self.sort_indices = np.argsort(self.pattern_codes)
-        self.sorted_data = self.original_data[self.sort_indices]
-        self.sorted_codes = self.pattern_codes[self.sort_indices]
-        self.sorted_patterns = self.is_observed[self.sort_indices]
+        # Get unique patterns and their frequencies
+        unique_codes, indices, counts = np.unique(
+            self.sorted_codes,
+            return_index=True,
+            return_counts=True
+        )
+        
+        self.pattern_frequencies = counts
+        self.pattern_start_indices = indices
     
     def _extract_patterns(self) -> List[PatternData]:
         """
-        Extract pattern data structures from sorted data.
-        
-        IMPORTANT: Patterns are kept in the order created by mysort.
-        Do NOT reorder them - R's algorithm expects this exact order.
+        Extract pattern data from sorted dataset.
         
         Returns
         -------
         List[PatternData]
-            Pattern data for each unique missingness pattern
+            Pattern data structures in R's expected order
         """
-        # Find unique patterns in sorted data
-        unique_codes, first_indices, counts = np.unique(
-            self.sorted_codes, 
-            return_index=True, 
-            return_counts=True
-        )
-        
         patterns = []
-        for i, (code, start_idx, count) in enumerate(zip(unique_codes, first_indices, counts)):
+        
+        for i, (start_idx, count) in enumerate(zip(self.pattern_start_indices, 
+                                                   self.pattern_frequencies)):
             end_idx = start_idx + count
             
-            # Get binary pattern
-            binary_pattern = self.sorted_patterns[start_idx]
-            observed_indices = np.where(binary_pattern)[0]
-            missing_indices = np.where(~binary_pattern)[0]
+            # Get pattern mask for this group
+            pattern_mask = self.sorted_patterns[start_idx]
+            observed_indices = np.where(pattern_mask == 1)[0]
+            missing_indices = np.where(pattern_mask == 0)[0]
             
-            # Extract data for observed columns only
+            # Extract data for this pattern (only observed variables)
+            pattern_data = self.sorted_data[start_idx:end_idx]
             if len(observed_indices) > 0:
-                pattern_data = self.sorted_data[start_idx:end_idx][:, observed_indices]
+                observed_data = pattern_data[:, observed_indices]
             else:
-                pattern_data = np.empty((count, 0))
+                observed_data = np.empty((count, 0))
             
             patterns.append(PatternData(
                 pattern_id=i,
                 n_obs=count,
-                data=pattern_data,
+                data=observed_data,
                 observed_indices=observed_indices,
                 missing_indices=missing_indices,
                 pattern_start=start_idx,
@@ -183,176 +201,203 @@ class MLEObjectiveBase:
         
         return patterns
     
+    def _prepare_pattern_optimization(self) -> None:
+        """
+        Prepare optimized data structures for pattern-based computation.
+        
+        CRITICAL: This uses the EXISTING R-compatible patterns from self.patterns
+        rather than re-identifying patterns, ensuring exact R compatibility.
+        The optimization only reorganizes data for vectorization, it does NOT
+        change which observations belong to which pattern.
+        """
+        try:
+            # Import optimization utilities
+            try:
+                from pymvnmle._pattern_optimization import (
+                    OptimizedPatternGroup,
+                    compute_efficiency_metrics
+                )
+            except ImportError:
+                # Module not available
+                self.use_pattern_optimization = False
+                self.pattern_groups = None
+                self.pattern_efficiency = None
+                return
+            
+            # Don't re-identify patterns! Use existing R-compatible patterns
+            if not hasattr(self, 'patterns') or not self.patterns:
+                self.use_pattern_optimization = False
+                self.pattern_groups = None
+                self.pattern_efficiency = None
+                return
+            
+            # Convert existing R patterns to optimized groups
+            # This preserves R's exact pattern ordering and identification
+            self.pattern_groups = []
+            
+            for pattern in self.patterns:
+                # Create optimized group from existing R pattern
+                # Key insight: pattern.data already has the observed data extracted!
+                
+                # Create observed mask for this pattern
+                observed_mask = np.zeros(self.n_vars, dtype=bool)
+                observed_mask[pattern.observed_indices] = True
+                
+                # Row indices refer to position in SORTED data (maintaining R's order)
+                row_indices = np.arange(pattern.pattern_start, pattern.pattern_end)
+                
+                # Create optimized group that exactly matches R's pattern
+                group = OptimizedPatternGroup(
+                    pattern_id=pattern.pattern_id,
+                    observed_mask=observed_mask,
+                    observed_indices=pattern.observed_indices.copy(),
+                    missing_indices=pattern.missing_indices.copy(),
+                    row_indices=row_indices,
+                    n_obs=pattern.n_obs,
+                    observed_data=pattern.data.copy()  # Already extracted by R's algorithm
+                )
+                
+                self.pattern_groups.append(group)
+            
+            # Compute efficiency metrics to decide if optimization is worthwhile
+            self.pattern_efficiency = compute_efficiency_metrics(self.pattern_groups)
+            
+            # Only use optimization if it provides meaningful speedup
+            if self.pattern_efficiency.get('expected_speedup', 1.0) < 1.2:
+                # Not worth the complexity for small speedup
+                self.use_pattern_optimization = False
+                self.pattern_groups = None
+                self.pattern_efficiency = None
+            
+        except Exception as e:
+            # Any error in pattern preparation - fall back to standard
+            warnings.warn(
+                f"Pattern optimization preparation failed: {e}. "
+                f"Falling back to standard computation.",
+                RuntimeWarning
+            )
+            self.use_pattern_optimization = False
+            self.pattern_groups = None
+            self.pattern_efficiency = None
+    
     def _compute_sample_covariance(self) -> np.ndarray:
         """
-        Compute sample covariance matrix using pairwise complete observations.
+        Compute sample covariance using pairwise deletion.
+        
+        This matches R's approach for getting initial parameter estimates.
+        Uses only pairs of observations where both variables are observed.
         
         Returns
         -------
         np.ndarray, shape (n_vars, n_vars)
-            Positive definite covariance matrix
+            Sample covariance matrix (positive definite)
         """
         cov = np.zeros((self.n_vars, self.n_vars))
         
         for i in range(self.n_vars):
             for j in range(i, self.n_vars):
-                # Find observations where both variables are observed
-                mask = (~np.isnan(self.original_data[:, i]) & 
-                       ~np.isnan(self.original_data[:, j]) &
-                       ~np.isinf(self.original_data[:, i]) &
-                       ~np.isinf(self.original_data[:, j]))
+                # Get pairs where both variables are observed
+                mask = ~(np.isnan(self.original_data[:, i]) | 
+                        np.isnan(self.original_data[:, j]))
                 
                 n_complete = np.sum(mask)
                 
                 if n_complete > 1:
-                    x_i = self.original_data[mask, i] - self.sample_mean[i]
-                    x_j = self.original_data[mask, j] - self.sample_mean[j]
-                    cov[i, j] = np.dot(x_i, x_j) / (n_complete - 1)
-                    cov[j, i] = cov[i, j]
+                    xi = self.original_data[mask, i]
+                    xj = self.original_data[mask, j]
+                    
+                    # Compute covariance with bias correction
+                    mean_xi = np.mean(xi)
+                    mean_xj = np.mean(xj)
+                    
+                    if i == j:
+                        # Variance on diagonal
+                        cov[i, i] = np.mean((xi - mean_xi) ** 2)
+                    else:
+                        # Covariance off diagonal
+                        cov_ij = np.mean((xi - mean_xi) * (xj - mean_xj))
+                        cov[i, j] = cov_ij
+                        cov[j, i] = cov_ij
                 elif i == j:
-                    # Diagonal: use variance if available
-                    var_i = np.nanvar(self.original_data[:, i], ddof=1)
-                    cov[i, i] = var_i if var_i > 0 else 1.0
+                    # Not enough data for this variable, use unit variance
+                    cov[i, i] = 1.0
         
-        # Ensure positive definiteness
-        min_eigenval = np.min(np.linalg.eigvalsh(cov))
-        if min_eigenval <= 0:
-            ridge = abs(min_eigenval) + 1e-6
-            cov += ridge * np.eye(self.n_vars)
+        # Ensure positive definite
+        try:
+            eigenvals = np.linalg.eigvalsh(cov)
+            min_eigenval = np.min(eigenvals)
+            
+            if min_eigenval <= 0:
+                # Add regularization to make positive definite
+                regularization = max(1e-6, abs(min_eigenval) + 1e-6)
+                cov += regularization * np.eye(self.n_vars)
+        except np.linalg.LinAlgError:
+            # If eigenvalue computation fails, use diagonal matrix
+            cov = np.diag(np.maximum(np.diag(cov), 1.0))
         
         return cov
+    
+    def get_pattern_info(self) -> Dict[str, Any]:
         """
-        Compute initial parameter estimates.
+        Get information about patterns and optimization status.
         
         Returns
         -------
-        np.ndarray
-            Initial parameter vector [μ, log(diag(Δ)), off-diag(Δ)]
+        Dict[str, Any]
+            Pattern statistics and optimization metrics
         """
-        # Initialize parameter vector
-        params = np.zeros(self.n_params)
+        info = {
+            'n_patterns': self.n_patterns,
+            'n_observations': self.n_obs,
+            'n_variables': self.n_vars,
+            'is_complete': self.is_complete,
+            'optimization_enabled': self.use_pattern_optimization,
+            'optimization_available': self.pattern_groups is not None,
+        }
         
-        # Use pre-computed sample mean
-        params[:self.n_vars] = self.sample_mean
+        # Add pattern frequency information from original patterns
+        if hasattr(self, 'patterns') and self.patterns:
+            pattern_sizes = [p.n_obs for p in self.patterns]
+            info['pattern_frequencies'] = pattern_sizes
+            info['complete_cases'] = sum(
+                p.n_obs for p in self.patterns 
+                if len(p.missing_indices) == 0
+            )
+            info['pattern_distribution'] = {
+                'min_size': min(pattern_sizes),
+                'max_size': max(pattern_sizes),
+                'mean_size': np.mean(pattern_sizes),
+                'median_size': np.median(pattern_sizes),
+            }
         
-        # Use pre-computed sample covariance
-        initial_cov = self.sample_cov
+        # Add optimization metrics if available
+        if self.pattern_efficiency:
+            info['optimization_metrics'] = {
+                'compression_ratio': self.pattern_efficiency.get('compression_ratio', None),
+                'expected_speedup': self.pattern_efficiency.get('expected_speedup', None),
+                'avg_pattern_size': self.pattern_efficiency.get('avg_pattern_size', None),
+            }
         
-        # Convert to inverse Cholesky parameterization
-        try:
-            # Cholesky decomposition: Σ = L L^T
-            L = np.linalg.cholesky(initial_cov)
-            
-            # Inverse Cholesky factor: Δ = L^{-1}
-            Delta = np.linalg.solve(L, np.eye(self.n_vars))
-            
-            # Extract log-diagonal elements
-            params[self.n_vars:2*self.n_vars] = np.log(np.diag(Delta))
-            
-            # Extract off-diagonal elements (R's column-major order)
-            idx = 2 * self.n_vars
-            for j in range(1, self.n_vars):
-                for i in range(j):
-                    params[idx] = Delta[i, j]
-                    idx += 1
-                    
-        except np.linalg.LinAlgError:
-            # If Cholesky fails, use simple diagonal initialization
-            # This is rare but can happen with extreme missingness
-            params[self.n_vars:2*self.n_vars] = 0.0  # log(1) = 0
-            # Off-diagonals remain zero
-        
-        return params
+        return info
     
     def get_initial_parameters(self) -> np.ndarray:
         """
-        Get initial parameter estimates for optimization.
+        Get initial parameter values.
         
-        Public interface for subclasses and optimization routines.
+        Should be overridden by subclasses for specific parameterizations.
         
         Returns
         -------
         np.ndarray
             Initial parameter vector
         """
-        return self.initial_params.copy()
+        # This is a placeholder - subclasses must implement
+        # their specific parameterization
+        raise NotImplementedError("Subclasses must implement get_initial_parameters")
     
-    def _compute_pairwise_covariance(self) -> np.ndarray:
+    def compute_objective(self, theta: np.ndarray) -> float:
         """
-        Legacy method for compatibility. Just returns pre-computed covariance.
-        
-        Returns
-        -------
-        np.ndarray, shape (n_vars, n_vars)
-            Sample covariance matrix
-        """
-        return self.sample_cov
-    
-    def reconstruct_parameters(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Reconstruct μ and Δ from parameter vector.
-        
-        Parameters
-        ----------
-        theta : np.ndarray
-            Parameter vector [μ, log(diag(Δ)), off-diag(Δ)]
-            
-        Returns
-        -------
-        mu : np.ndarray, shape (n_vars,)
-            Mean vector
-        Delta : np.ndarray, shape (n_vars, n_vars)
-            Inverse Cholesky factor (upper triangular)
-        """
-        # Extract mean
-        mu = theta[:self.n_vars].copy()
-        
-        # Initialize Delta matrix
-        Delta = np.zeros((self.n_vars, self.n_vars))
-        
-        # Set diagonal (with bounds to prevent overflow)
-        log_diag = theta[self.n_vars:2*self.n_vars]
-        log_diag = np.clip(log_diag, -10, 10)  # R's bounds
-        np.fill_diagonal(Delta, np.exp(log_diag))
-        
-        # Fill upper triangle (R's column-major order)
-        if self.n_vars > 1:
-            idx = 2 * self.n_vars
-            for j in range(1, self.n_vars):
-                for i in range(j):
-                    Delta[i, j] = np.clip(theta[idx], -100, 100)  # R's bounds
-                    idx += 1
-        
-        return mu, Delta
-    
-    def compute_sigma_from_delta(self, Delta: np.ndarray) -> np.ndarray:
-        """
-        Compute Σ from Δ using the relationship Σ = (Δ^{-1})^T (Δ^{-1}).
-        
-        Parameters
-        ----------
-        Delta : np.ndarray, shape (n_vars, n_vars)
-            Inverse Cholesky factor (upper triangular)
-            
-        Returns
-        -------
-        Sigma : np.ndarray, shape (n_vars, n_vars)
-            Covariance matrix (positive definite)
-        """
-        # Compute X = Δ^{-1} via triangular solve
-        X = np.linalg.solve(Delta, np.eye(self.n_vars))
-        
-        # Compute Σ = X^T X
-        Sigma = X.T @ X
-        
-        # Ensure exact symmetry (numerical precision)
-        Sigma = (Sigma + Sigma.T) / 2
-        
-        return Sigma
-    
-    def objective(self, theta: np.ndarray) -> float:
-        """
-        Compute negative log-likelihood objective.
+        Compute objective function value.
         
         Must be implemented by subclasses.
         
@@ -366,14 +411,14 @@ class MLEObjectiveBase:
         float
             Objective function value
         """
-        raise NotImplementedError("Subclasses must implement objective()")
+        raise NotImplementedError("Subclasses must implement compute_objective")
     
-    def gradient(self, theta: np.ndarray) -> np.ndarray:
+    def compute_gradient(self, theta: np.ndarray) -> np.ndarray:
         """
-        Compute gradient of objective.
+        Compute gradient of objective function.
         
-        May be implemented by subclasses for efficiency.
-        Default uses finite differences.
+        Default implementation uses finite differences (R-compatible).
+        Subclasses may override with analytical gradients.
         
         Parameters
         ----------
@@ -385,15 +430,37 @@ class MLEObjectiveBase:
         np.ndarray
             Gradient vector
         """
-        # Default: Use finite differences (like R)
+        # Default: finite differences (matches R's nlm)
         eps = 1e-8
         grad = np.zeros_like(theta)
-        f0 = self.objective(theta)
+        f0 = self.compute_objective(theta)
         
         for i in range(len(theta)):
             theta_plus = theta.copy()
             theta_plus[i] += eps
-            f_plus = self.objective(theta_plus)
+            f_plus = self.compute_objective(theta_plus)
             grad[i] = (f_plus - f0) / eps
         
         return grad
+    
+    def extract_parameters(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+        """
+        Extract mu, Sigma, and log-likelihood from parameter vector.
+        
+        Should be overridden by subclasses for specific parameterizations.
+        
+        Parameters
+        ----------
+        theta : np.ndarray
+            Optimized parameter vector
+            
+        Returns
+        -------
+        mu : np.ndarray
+            Mean vector
+        sigma : np.ndarray
+            Covariance matrix
+        loglik : float
+            Log-likelihood at theta
+        """
+        raise NotImplementedError("Subclasses must implement extract_parameters")

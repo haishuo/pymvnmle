@@ -25,15 +25,29 @@ from .parameterizations import (
 # Import CPU objective (always available)
 from .cpu_fp64_objective import CPUObjectiveFP64
 
+# MODIFIED: Lazy import GPU objectives to avoid PyTorch initialization
 # Try to import GPU objectives (optional)
-try:
-    from .gpu_fp32_objective import GPUObjectiveFP32
-    from .gpu_fp64_objective import GPUObjectiveFP64
-    GPU_AVAILABLE = True
-except ImportError:
-    GPU_AVAILABLE = False
-    GPUObjectiveFP32 = None
-    GPUObjectiveFP64 = None
+GPU_AVAILABLE = False
+GPUObjectiveFP32 = None
+GPUObjectiveFP64 = None
+
+def _lazy_import_gpu():
+    """Lazily import GPU objectives only when needed."""
+    global GPU_AVAILABLE, GPUObjectiveFP32, GPUObjectiveFP64
+    
+    if GPU_AVAILABLE:
+        return True  # Already imported
+    
+    try:
+        # Only import when actually needed
+        from .gpu_fp32_objective import GPUObjectiveFP32 as _FP32
+        from .gpu_fp64_objective import GPUObjectiveFP64 as _FP64
+        GPUObjectiveFP32 = _FP32
+        GPUObjectiveFP64 = _FP64
+        GPU_AVAILABLE = True
+        return True
+    except ImportError:
+        return False
 
 
 def get_objective(data: np.ndarray,
@@ -76,7 +90,8 @@ def get_objective(data: np.ndarray,
         return CPUObjectiveFP64(data, **kwargs)
     
     elif backend in ['gpu', 'pytorch', 'cuda', 'metal']:
-        if not GPU_AVAILABLE:
+        # MODIFIED: Lazy import GPU objectives
+        if not _lazy_import_gpu():
             raise ImportError(
                 "GPU objectives require PyTorch. "
                 "Install with: pip install torch"
@@ -99,84 +114,101 @@ def get_objective(data: np.ndarray,
     else:
         raise ValueError(
             f"Unknown backend: {backend}. "
-            f"Available: 'cpu', 'gpu', 'numpy', 'pytorch'"
+            f"Choose from: 'cpu', 'gpu', 'numpy', 'pytorch'"
         )
 
 
-def _auto_select_precision(device: Optional[str]) -> str:
+def _auto_select_precision(device: Optional[str] = None) -> str:
     """
-    Auto-select precision based on hardware capabilities.
-    
-    Parameters
-    ----------
-    device : str or None
-        Device specification
-        
-    Returns
-    -------
-    str
-        'fp32' or 'fp64'
+    Auto-select precision based on device capabilities.
     """
-    # Import here to avoid circular dependency
-    from pymvnmle._backends.precision_detector import detect_gpu_capabilities
+    # MODIFIED: Import torch only when needed
+    import torch
     
-    caps = detect_gpu_capabilities()
+    if device is None:
+        if torch.cuda.is_available():
+            device = 'cuda'
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            device = 'mps'
+        else:
+            device = 'cpu'
     
-    # If Metal or gimped FP64, use FP32
-    if caps.gpu_type == 'metal' or not caps.recommended_fp64:
-        return 'fp32'
+    if device == 'cuda':
+        # Check compute capability
+        if torch.cuda.is_available():
+            capability = torch.cuda.get_device_capability()
+            # Datacenter GPUs (V100, A100, etc) have good FP64
+            if capability[0] >= 7:
+                return 'fp64'
     
-    # If full FP64 support, use it
-    return 'fp64'
+    # Default to FP32 for consumer GPUs and Apple Silicon
+    return 'fp32'
 
 
 def create_objective(data: np.ndarray,
-                    use_fp64: bool = True,
                     use_gpu: bool = False,
+                    use_fp64: bool = True,
+                    device: Optional[str] = None,
+                    compile_enabled: bool = True,
                     **kwargs) -> MLEObjectiveBase:
     """
-    Create objective with simple boolean flags.
+    Simplified interface for creating objectives.
     
     Parameters
     ----------
     data : np.ndarray
-        Input data
-    use_fp64 : bool
-        Whether to use FP64 precision
+        Input data with missing values
     use_gpu : bool
         Whether to use GPU acceleration
+    use_fp64 : bool
+        Whether to use 64-bit precision (if False, uses 32-bit)
+    device : str or None
+        Specific device to use ('cuda', 'mps', etc)
+    compile_enabled : bool
+        Whether to compile GPU objectives with torch.compile
     **kwargs
-        Additional options
+        Additional backend-specific options
         
     Returns
     -------
     MLEObjectiveBase
-        Objective instance
+        Objective function instance
+        
+    Examples
+    --------
+    >>> # CPU objective
+    >>> obj = create_objective(data, use_gpu=False)
+    >>> 
+    >>> # GPU with FP32
+    >>> obj = create_objective(data, use_gpu=True, use_fp64=False)
     """
-    if not use_gpu:
-        return CPUObjectiveFP64(data, **kwargs)
-    
-    if not GPU_AVAILABLE:
-        warnings.warn(
-            "GPU requested but PyTorch not available, falling back to CPU"
+    if use_gpu:
+        # MODIFIED: Check GPU availability lazily
+        if not _lazy_import_gpu():
+            warnings.warn(
+                "GPU requested but PyTorch not available. Falling back to CPU.",
+                RuntimeWarning
+            )
+            return CPUObjectiveFP64(data, **kwargs)
+        
+        precision = 'fp64' if use_fp64 else 'fp32'
+        return get_objective(
+            data, 
+            backend='gpu', 
+            precision=precision,
+            device=device,
+            compile_enabled=compile_enabled,
+            **kwargs
         )
-        return CPUObjectiveFP64(data, **kwargs)
-    
-    if use_fp64:
-        try:
-            return GPUObjectiveFP64(data, **kwargs)
-        except RuntimeError as e:
-            warnings.warn(f"FP64 GPU failed: {e}. Falling back to FP32.")
-            return GPUObjectiveFP32(data, **kwargs)
     else:
-        return GPUObjectiveFP32(data, **kwargs)
+        return CPUObjectiveFP64(data, **kwargs)
 
 
 def compare_objectives(data: np.ndarray,
                       theta: np.ndarray,
-                      backends: list = ['cpu', 'gpu']) -> dict:
+                      backends: Optional[list] = None) -> dict:
     """
-    Compare objective values across different backends.
+    Compare different objective implementations.
     
     Parameters
     ----------
@@ -202,10 +234,18 @@ def compare_objectives(data: np.ndarray,
         try:
             if backend == 'cpu':
                 obj = CPUObjectiveFP64(data)
-            elif backend == 'gpu_fp32' and GPU_AVAILABLE:
-                obj = GPUObjectiveFP32(data)
-            elif backend == 'gpu_fp64' and GPU_AVAILABLE:
-                obj = GPUObjectiveFP64(data)
+            elif backend == 'gpu_fp32':
+                # MODIFIED: Lazy import check
+                if _lazy_import_gpu():
+                    obj = GPUObjectiveFP32(data)
+                else:
+                    continue
+            elif backend == 'gpu_fp64':
+                # MODIFIED: Lazy import check
+                if _lazy_import_gpu():
+                    obj = GPUObjectiveFP64(data)
+                else:
+                    continue
             else:
                 continue
             
@@ -255,7 +295,8 @@ def benchmark_objectives(data: np.ndarray,
         ('cpu', CPUObjectiveFP64),
     ]
     
-    if GPU_AVAILABLE:
+    # MODIFIED: Only add GPU if successfully imported
+    if _lazy_import_gpu():
         backends.extend([
             ('gpu_fp32', GPUObjectiveFP32),
             ('gpu_fp64', GPUObjectiveFP64),
@@ -332,8 +373,9 @@ __all__ = [
     
     # Objectives
     'CPUObjectiveFP64',
-    'GPUObjectiveFP32',
-    'GPUObjectiveFP64',
+    # MODIFIED: Don't export GPU objectives directly to avoid import
+    # 'GPUObjectiveFP32',
+    # 'GPUObjectiveFP64',
     
     # Factory functions
     'get_objective',

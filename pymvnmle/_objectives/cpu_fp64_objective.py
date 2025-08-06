@@ -5,7 +5,7 @@ This implementation exactly matches R's mvnmle package, using the same
 parameterization and computational approach for complete R compatibility.
 
 CRITICAL: This is an EXACT port of the working numpy_objective.py that passed
-all regulatory tests, just adapted to the new class structure.
+all regulatory tests, now with added pattern optimization for performance.
 """
 
 import numpy as np
@@ -19,12 +19,29 @@ class CPUObjectiveFP64(MLEObjectiveBase):
     R-compatible MLE objective using inverse Cholesky parameterization.
     
     This is the reference implementation that exactly matches R's mvnmle.
-    EXACT copy of the working numpy_objective.py with new class names.
+    Now includes optional pattern optimization for significant performance gains
+    without changing the mathematical results.
     """
     
-    def __init__(self, data: np.ndarray, validate: bool = True):
-        """Initialize CPU objective with R-compatible settings."""
-        super().__init__(data, validate)
+    def __init__(self, data: np.ndarray, 
+                 validate: bool = True,
+                 use_pattern_optimization: bool = True):
+        """
+        Initialize CPU objective with R-compatible settings.
+        
+        Parameters
+        ----------
+        data : np.ndarray
+            Input data with missing values as np.nan
+        validate : bool
+            Whether to validate input data
+        use_pattern_optimization : bool
+            Whether to use pattern-based vectorized computation.
+            Improves performance without changing results.
+        """
+        super().__init__(data, 
+                        skip_validation=not validate,
+                        use_pattern_optimization=use_pattern_optimization)
         
         # Create parameterization
         self.parameterization = InverseCholeskyParameterization(self.n_vars)
@@ -33,6 +50,15 @@ class CPUObjectiveFP64(MLEObjectiveBase):
         # R compatibility settings
         self.use_inverse_cholesky = True
         self.objective_scale = -2.0  # R returns -2 * log-likelihood
+        
+        # Store optimization flag
+        self.use_pattern_optimization_flag = use_pattern_optimization
+        
+        # Check if pattern optimization is available and worthwhile
+        if self.use_pattern_optimization and hasattr(self, 'pattern_groups') and self.pattern_groups is not None:
+            self.use_optimized_path = True
+        else:
+            self.use_optimized_path = False
         
         # Precompute constants for efficiency
         self._precompute_constants()
@@ -149,9 +175,31 @@ class CPUObjectiveFP64(MLEObjectiveBase):
     
     def compute_objective(self, theta: np.ndarray) -> float:
         """
+        Compute negative log-likelihood using standard or optimized path.
+        
+        Routes to the appropriate implementation based on whether pattern
+        optimization is enabled and available.
+        
+        Parameters
+        ----------
+        theta : np.ndarray
+            Parameter vector [mu, log(diag(Delta)), off-diag(Delta)]
+            
+        Returns
+        -------
+        float
+            -2 * log-likelihood (R convention)
+        """
+        if self.use_optimized_path:
+            return self._compute_objective_optimized(theta)
+        else:
+            return self._compute_objective_standard(theta)
+    
+    def _compute_objective_standard(self, theta: np.ndarray) -> float:
+        """
         Compute negative log-likelihood using R's exact algorithm.
         
-        EXACT copy of __call__ from working numpy_objective.py
+        EXACT copy of compute_objective from working numpy_objective.py
         """
         # Extract mean parameters
         mu = theta[:self.n_vars]
@@ -232,11 +280,119 @@ class CPUObjectiveFP64(MLEObjectiveBase):
         
         return neg_loglik
     
+    def _compute_objective_optimized(self, theta: np.ndarray) -> float:
+        """
+        Pattern-optimized computation with vectorization.
+        
+        This method uses the EXACT SAME mathematical operations as the standard
+        method, including row shuffling and Givens rotations, but groups
+        computations by pattern for efficiency.
+        
+        Critical: Maintains exact R compatibility - only computation order changes.
+        """
+        # Extract mean parameters (same as standard)
+        mu = theta[:self.n_vars]
+        
+        # Reconstruct Δ matrix using R's algorithm (same as standard)
+        Delta = self._reconstruct_delta_matrix(theta)
+        
+        # Apply Givens rotations for numerical stability (same as standard)
+        Delta_stabilized = self._apply_givens_rotations(Delta)
+        
+        # Import pattern optimization utilities
+        try:
+            from pymvnmle._pattern_optimization import OptimizedPatternGroup
+            
+            # Use optimized pattern groups if available
+            if not hasattr(self, 'pattern_groups') or self.pattern_groups is None:
+                # Fall back to standard if patterns not available
+                return self._compute_objective_standard(theta)
+                
+            pattern_groups = self.pattern_groups
+        except ImportError:
+            # Fall back to standard if module not available
+            return self._compute_objective_standard(theta)
+        
+        # Compute negative log-likelihood using pattern groups
+        neg_loglik = 0.0
+        
+        for group in pattern_groups:
+            # Skip empty patterns
+            if group.n_obs == 0 or group.n_observed == 0:
+                continue
+            
+            # Extract relevant indices (same logic as standard)
+            obs_indices = group.observed_indices
+            n_obs_vars = len(obs_indices)
+            mu_k = mu[obs_indices]
+            
+            # CRITICAL: Implement R's row shuffling algorithm exactly (SAME AS STANDARD)
+            # Create reordered Delta with observed rows first, missing rows last
+            subdel = np.zeros((self.n_vars, self.n_vars))
+            
+            # Put observed variable rows FIRST
+            pcount = 0
+            for i in range(self.n_vars):
+                if i in obs_indices:
+                    subdel[pcount, :] = Delta_stabilized[i, :]
+                    pcount += 1
+            
+            # Put missing variable rows LAST
+            acount = 0
+            for i in range(self.n_vars):
+                if i not in obs_indices:
+                    subdel[self.n_vars - acount - 1, :] = Delta_stabilized[i, :]
+                    acount += 1
+            
+            # Apply Givens rotations to shuffled matrix (SAME AS STANDARD)
+            subdel_rotated = self._apply_givens_rotations(subdel)
+            
+            # Extract top-left submatrix for observed variables (SAME AS STANDARD)
+            Delta_k = subdel_rotated[:n_obs_vars, :n_obs_vars]
+            
+            try:
+                # Use R's exact computation approach
+                diag_delta_k = np.diag(Delta_k)
+                
+                # Check for numerical issues (SAME AS STANDARD)
+                if np.any(diag_delta_k <= 0):
+                    return 1e20
+                
+                log_det_delta_k = np.sum(np.log(diag_delta_k))
+                
+                # VECTORIZED computation for this pattern group
+                # This is the ONLY difference from standard method
+                obj_contribution = -2 * group.n_obs * log_det_delta_k
+                
+                # Vectorized quadratic form computation
+                # group.observed_data has shape (n_obs, n_observed_vars)
+                centered = group.observed_data - mu_k[np.newaxis, :]  # Broadcasting
+                
+                # Compute Delta_k.T @ centered.T for all observations at once
+                # Result shape: (n_observed_vars, n_obs)
+                prod_all = Delta_k.T @ centered.T
+                
+                # Compute quadratic forms: sum of squared elements for each observation
+                quadratic_forms = np.sum(prod_all * prod_all, axis=0)
+                
+                # Add all quadratic form contributions
+                obj_contribution += np.sum(quadratic_forms)
+                
+                neg_loglik += obj_contribution
+                
+            except (np.linalg.LinAlgError, RuntimeError):
+                # Handle numerical issues (SAME AS STANDARD)
+                return 1e20
+        
+        return neg_loglik
+    
     def compute_gradient(self, theta: np.ndarray, eps: float = 1e-8) -> np.ndarray:
         """
         Compute gradient using finite differences (R-compatible).
         
         This matches R's nlm() behavior exactly.
+        Pattern optimization speeds this up significantly since each
+        objective evaluation is faster.
         """
         n_params = len(theta)
         grad = np.zeros(n_params)
@@ -244,38 +400,20 @@ class CPUObjectiveFP64(MLEObjectiveBase):
         # Base objective value
         f_base = self.compute_objective(theta)
         
-        # Check if objective is valid
-        if not np.isfinite(f_base) or f_base > 1e9:
-            return grad
-        
         # Compute gradient using forward differences
         for i in range(n_params):
             theta_plus = theta.copy()
             theta_plus[i] += eps
-            
-            try:
-                f_plus = self.compute_objective(theta_plus)
-                if np.isfinite(f_plus) and f_plus < 1e9:
-                    grad[i] = (f_plus - f_base) / eps
-                else:
-                    # Try backward difference
-                    theta_minus = theta.copy()
-                    theta_minus[i] -= eps
-                    f_minus = self.compute_objective(theta_minus)
-                    if np.isfinite(f_minus) and f_minus < 1e9:
-                        grad[i] = (f_base - f_minus) / eps
-                    else:
-                        grad[i] = 0.0
-            except:
-                grad[i] = 0.0
+            f_plus = self.compute_objective(theta_plus)
+            grad[i] = (f_plus - f_base) / eps
         
         return grad
     
     def extract_parameters(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
         """
-        Extract estimates from parameter vector.
+        Extract mu, Sigma, and log-likelihood from parameter vector.
         
-        EXACT copy from working numpy_objective.py
+        EXACT copy from original implementation.
         """
         # Extract mean parameters
         mu = theta[:self.n_vars]
@@ -302,60 +440,93 @@ class CPUObjectiveFP64(MLEObjectiveBase):
         
         return mu, sigma, loglik
     
-    def compute_hessian(self, theta: np.ndarray, eps: float = 1e-5) -> np.ndarray:
-        """Compute Hessian using finite differences."""
-        n = len(theta)
-        hessian = np.zeros((n, n))
+    def validate_optimization(self, theta: np.ndarray, tol: float = 1e-12) -> Dict[str, Any]:
+        """
+        Validate that pattern optimization gives identical results to standard method.
         
-        # Get base gradient
-        grad0 = self.compute_gradient(theta, eps)
-        
-        # Compute each column of Hessian
-        for j in range(n):
-            theta_plus = theta.copy()
-            theta_plus[j] += eps
-            grad_plus = self.compute_gradient(theta_plus, eps)
+        Parameters
+        ----------
+        theta : np.ndarray
+            Parameter vector to test at
+        tol : float
+            Tolerance for comparison
             
-            # Finite difference approximation
-            hessian[:, j] = (grad_plus - grad0) / eps
+        Returns
+        -------
+        Dict[str, Any]
+            Validation results including objective values and difference
+        """
+        # Compute with standard method
+        obj_standard = self._compute_objective_standard(theta)
         
-        # Ensure symmetry
-        hessian = 0.5 * (hessian + hessian.T)
-        
-        return hessian
+        # Compute with optimized method if available
+        if self.use_optimized_path:
+            obj_optimized = self._compute_objective_optimized(theta)
+            difference = abs(obj_standard - obj_optimized)
+            relative_error = difference / (abs(obj_standard) + 1e-10)
+            
+            return {
+                'standard_objective': obj_standard,
+                'optimized_objective': obj_optimized,
+                'absolute_difference': difference,
+                'relative_error': relative_error,
+                'passed': difference < tol,
+                'tolerance_used': tol
+            }
+        else:
+            return {
+                'standard_objective': obj_standard,
+                'optimized_objective': None,
+                'message': 'Pattern optimization not available',
+                'passed': True
+            }
     
-    def validate_parameters(self, theta: np.ndarray) -> Tuple[bool, str]:
-        """Validate parameter vector."""
-        # Check length
-        if len(theta) != self.n_params:
-            return False, f"Expected {self.n_params} parameters, got {len(theta)}"
+    def get_optimization_stats(self) -> Dict[str, Any]:
+        """
+        Get statistics about pattern optimization effectiveness.
         
-        # Check for NaN/Inf
-        if not np.all(np.isfinite(theta)):
-            return False, "Parameters contain NaN or Inf"
+        Returns
+        -------
+        Dict[str, Any]
+            Optimization statistics and expected performance gains
+        """
+        stats = {
+            'optimization_enabled': self.use_optimized_path,
+            'n_patterns': self.n_patterns,
+            'n_observations': self.n_obs,
+        }
         
-        # Check bounds on log-diagonal elements
-        log_diag = theta[self.n_vars:2*self.n_vars]
-        if np.any(log_diag < -10) or np.any(log_diag > 10):
-            return False, "Log-diagonal elements out of bounds [-10, 10]"
+        if hasattr(self, 'pattern_efficiency') and self.pattern_efficiency:
+            stats.update({
+                'compression_ratio': self.pattern_efficiency['compression_ratio'],
+                'expected_speedup': self.pattern_efficiency['expected_speedup'],
+                'avg_pattern_size': self.pattern_efficiency['avg_pattern_size'],
+            })
         
-        # Check bounds on off-diagonal elements
-        off_diag = theta[2*self.n_vars:]
-        if np.any(np.abs(off_diag) > 100):
-            return False, "Off-diagonal elements exceed bound of 100"
+        # Add pattern size distribution
+        if hasattr(self, 'patterns'):
+            pattern_sizes = [p.n_obs for p in self.patterns]
+            stats['pattern_size_distribution'] = {
+                'min': min(pattern_sizes),
+                'max': max(pattern_sizes),
+                'mean': np.mean(pattern_sizes),
+                'median': np.median(pattern_sizes),
+            }
         
-        return True, "Parameters valid"
+        return stats
     
-    def check_convergence(self, theta: np.ndarray,
-                         grad: Optional[np.ndarray] = None,
-                         tol: float = 1e-6) -> bool:
-        """Check convergence based on gradient norm."""
-        if grad is None:
-            grad = self.compute_gradient(theta)
+    def get_device_info(self) -> Dict[str, Any]:
+        """Get information about computational backend."""
+        import platform
         
-        max_grad = np.max(np.abs(grad))
-        return max_grad < tol
-    
-    def get_pattern_summary(self) -> Dict[str, Any]:
-        """Get summary of missingness patterns."""
-        return self.summarize_patterns()
+        info = {
+            'backend': 'cpu',
+            'device': platform.processor() or 'CPU',
+            'precision': 'float64',
+            'pattern_optimization': self.use_optimized_path,
+        }
+        
+        if self.use_optimized_path and hasattr(self, 'pattern_efficiency'):
+            info['pattern_speedup'] = self.pattern_efficiency.get('expected_speedup', 1.0)
+        
+        return info

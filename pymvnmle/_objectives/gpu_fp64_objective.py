@@ -30,7 +30,7 @@ class GPUObjectiveFP64(MLEObjectiveBase):
                  device: Optional[str] = None,
                  validate: bool = True,
                  verify_fp64_performance: bool = True,
-                 compile_objective: bool = True):
+                 compile_objective: bool = False):  # DISABLED due to trace issues
         """
         Initialize GPU FP64 objective.
         
@@ -46,6 +46,7 @@ class GPUObjectiveFP64(MLEObjectiveBase):
             Whether to check FP64 performance on initialization
         compile_objective : bool
             Whether to compile objective with torch.compile
+            (DISABLED by default due to trace operation issues)
         """
         # Initialize base class (handles preprocessing)
         super().__init__(data, validate)
@@ -67,63 +68,50 @@ class GPUObjectiveFP64(MLEObjectiveBase):
         # Select device (must be CUDA for FP64)
         self.device = self._select_device(device)
         
-        # Verify FP64 performance if requested
-        if verify_fp64_performance:
-            self._verify_fp64_performance()
-        
         # FP64 settings
         self.dtype = torch.float64
-        self.eps = 1e-10  # Much smaller epsilon for FP64
+        self.eps = 1e-12  # Tighter epsilon for FP64
+        
+        # Check FP64 performance
+        if verify_fp64_performance and self.device.type == 'cuda':
+            self._check_fp64_performance()
         
         # Transfer pattern data to GPU
         self._prepare_gpu_data()
         
-        # Compile objective for performance
-        if compile_objective and hasattr(torch, 'compile'):
-            try:
-                self._compiled_objective = torch.compile(self._torch_objective)
-                self._compiled_gradient = torch.compile(self._compute_gradient_torch)
-                self.use_compiled = True
-            except:
-                self.use_compiled = False
-                warnings.warn("Failed to compile objective, using eager mode")
-        else:
-            self.use_compiled = False
+        # Disable compilation due to trace backward issues
+        self.use_compiled = False
+        if compile_objective:
+            warnings.warn(
+                "torch.compile is disabled for GPU objectives due to trace operation compatibility issues",
+                RuntimeWarning
+            )
     
     def _select_device(self, requested_device: Optional[str]) -> Any:
-        """Select CUDA device for FP64 computation."""
+        """Select appropriate GPU device for FP64."""
         torch = self.torch
         
-        # FP64 requires CUDA (not Metal)
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "FP64 GPU objective requires CUDA. No CUDA devices found. "
-                "Use FP32 objective for Apple Silicon or CPU objective."
-            )
-        
         if requested_device:
-            if not requested_device.startswith('cuda'):
-                raise ValueError(
-                    f"FP64 objective requires CUDA device, got {requested_device}"
+            device = torch.device(requested_device)
+            if device.type != 'cuda':
+                warnings.warn(
+                    f"FP64 objective requested on {device.type}. "
+                    f"Performance may be poor. Consider using FP32 objective."
                 )
-            return torch.device(requested_device)
+            return device
         
-        # Auto-select best CUDA device for FP64
-        device_count = torch.cuda.device_count()
-        best_device = 0
-        best_memory = 0
-        
-        for i in range(device_count):
-            props = torch.cuda.get_device_properties(i)
-            # Prefer devices with more memory for FP64
-            if props.total_memory > best_memory:
-                best_memory = props.total_memory
-                best_device = i
-        
-        return torch.device(f'cuda:{best_device}')
+        # Auto-select: prefer CUDA for FP64
+        if torch.cuda.is_available():
+            return torch.device('cuda')
+        else:
+            warnings.warn(
+                "No CUDA device available for FP64. "
+                "Using CPU fallback (will be very slow)."
+            )
+            return torch.device('cpu')
     
-    def _verify_fp64_performance(self) -> None:
-        """Check if GPU has acceptable FP64 performance."""
+    def _check_fp64_performance(self) -> None:
+        """Check if GPU has good FP64 performance."""
         torch = self.torch
         import time
         
@@ -245,7 +233,7 @@ class GPUObjectiveFP64(MLEObjectiveBase):
         Returns
         -------
         torch.Tensor
-            Scalar objective value
+            Scalar objective value (-2 * log-likelihood for R compatibility)
         """
         torch = self.torch
         
@@ -273,13 +261,17 @@ class GPUObjectiveFP64(MLEObjectiveBase):
             # Weight by number of observations
             obj_value = obj_value + gpu_pattern['n_obs'] * contrib
         
-        return obj_value.squeeze()
+        # CRITICAL: Multiply by 2 for R compatibility (-2 * log-likelihood)
+        return 2.0 * obj_value.squeeze()
     
     def _compute_pattern_contribution_gpu(self, pattern: Dict,
                                          mu_k: Any,
                                          sigma_k: Any) -> Any:
         """
         Compute pattern contribution with FP64 precision.
+        
+        Uses R-compatible formula: n_k * [const + log|Σ| + tr(Σ⁻¹S)]
+        where S is the sample covariance matrix.
         
         Parameters
         ----------
@@ -293,30 +285,36 @@ class GPUObjectiveFP64(MLEObjectiveBase):
         Returns
         -------
         torch.Tensor
-            Pattern contribution to objective
+            Pattern contribution to objective (total, not per observation)
         """
         torch = self.torch
         
+        n_obs = pattern['n_obs']
         n_obs_vars = pattern['n_observed']
         
-        # Constant term
-        const_term = n_obs_vars * self.log_2pi_gpu
+        # Constant term for all observations in this pattern
+        const_term = n_obs * n_obs_vars * self.log_2pi_gpu
         
-        # Log determinant using Cholesky (stable with FP64)
+        # Log determinant term for all observations
         L_k = torch.linalg.cholesky(sigma_k)
         log_det = 2.0 * torch.sum(torch.log(torch.diag(L_k)))
+        log_det_term = n_obs * log_det
         
-        # Compute sample covariance
-        data_centered = pattern['data'] - mu_k
-        S_k = (data_centered.T @ data_centered) / pattern['n_obs']
+        # Compute sample covariance matrix (R-style)
+        data_centered = pattern['data'] - mu_k  # shape: (n_obs, n_observed)
+        S_k = (data_centered.T @ data_centered) / n_obs
         
         # Trace term: tr(Σ_k^-1 * S_k)
         # Use Cholesky solve for numerical stability
         Y = torch.linalg.solve_triangular(L_k, S_k, upper=False)
-        X = torch.linalg.solve_triangular(L_k.T, Y, upper=True)
-        trace_term = torch.trace(X)
+        Z = torch.linalg.solve_triangular(L_k.T, Y, upper=True)
+        trace_term = torch.trace(Z)
+        trace_term = n_obs * trace_term
         
-        return const_term + log_det + trace_term
+        # Total contribution (not averaged)
+        total_contribution = const_term + log_det_term + trace_term
+        
+        return total_contribution / n_obs  # Return per-observation average for consistency
     
     def _unpack_gpu(self, theta_gpu: Any) -> Tuple[Any, Any]:
         """
@@ -385,26 +383,20 @@ class GPUObjectiveFP64(MLEObjectiveBase):
             requires_grad=True
         )
         
-        if self.use_compiled:
-            grad_gpu = self._compiled_gradient(theta_gpu)
-        else:
-            grad_gpu = self._compute_gradient_torch(theta_gpu)
-        
-        return grad_gpu.cpu().numpy()
-    
-    def _compute_gradient_torch(self, theta_gpu: Any) -> Any:
-        """Compute gradient on GPU."""
-        # Compute objective
+        # Compute objective (never use compiled version for gradients)
         obj_value = self._torch_objective(theta_gpu)
         
         # Compute gradient via autodiff
-        grad = self.torch.autograd.grad(obj_value, theta_gpu)[0]
+        obj_value.backward()
         
-        return grad
+        # Return as NumPy array
+        return theta_gpu.grad.cpu().numpy()
     
     def compute_hessian(self, theta: np.ndarray) -> np.ndarray:
         """
-        Compute full Hessian matrix using automatic differentiation.
+        Compute Hessian matrix using automatic differentiation.
+        
+        Enables Newton-CG optimization for FP64.
         
         Parameters
         ----------
@@ -413,13 +405,8 @@ class GPUObjectiveFP64(MLEObjectiveBase):
             
         Returns
         -------
-        np.ndarray, shape (n_params, n_params)
-            Hessian matrix
-            
-        Notes
-        -----
-        This is the key capability that FP64 enables - accurate
-        Hessian computation for Newton-CG optimization.
+        np.ndarray
+            Hessian matrix of shape (n_params, n_params)
         """
         torch = self.torch
         
@@ -431,33 +418,36 @@ class GPUObjectiveFP64(MLEObjectiveBase):
             requires_grad=True
         )
         
-        # Compute gradient with computation graph
-        obj_value = self._torch_objective(theta_gpu)
-        grad = torch.autograd.grad(obj_value, theta_gpu, create_graph=True)[0]
+        # Compute gradient with create_graph=True for second derivatives
+        if self.use_compiled:
+            obj_value = self._compiled_objective(theta_gpu)
+        else:
+            obj_value = self._torch_objective(theta_gpu)
+        
+        # First derivatives
+        grad = torch.autograd.grad(
+            obj_value, theta_gpu, 
+            create_graph=True, retain_graph=True
+        )[0]
         
         # Compute Hessian row by row
         hessian = []
         for i in range(self.n_params):
             # Second derivative with respect to theta[i]
             grad2 = torch.autograd.grad(
-                grad[i],
-                theta_gpu,
+                grad[i], theta_gpu,
                 retain_graph=True
             )[0]
-            hessian.append(grad2)
+            hessian.append(grad2.cpu().numpy())
         
-        # Stack into matrix
-        hessian = torch.stack(hessian)
-        
-        # Ensure symmetry
-        hessian = 0.5 * (hessian + hessian.T)
-        
-        return hessian.cpu().numpy()
+        return np.array(hessian)
     
     def compute_newton_direction(self, theta: np.ndarray,
                                 grad: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Compute Newton direction for Newton-CG.
+        
+        Solves: H d = -g where H is Hessian, g is gradient
         
         Parameters
         ----------
@@ -469,28 +459,29 @@ class GPUObjectiveFP64(MLEObjectiveBase):
         Returns
         -------
         np.ndarray
-            Newton direction: -H^{-1} @ grad
+            Newton direction vector
         """
         if grad is None:
             grad = self.compute_gradient(theta)
         
-        # Compute Hessian
         hessian = self.compute_hessian(theta)
         
-        # Add small regularization for numerical stability
-        hessian += self.eps * np.eye(self.n_params)
-        
-        # Solve H @ d = -grad for Newton direction
+        # Solve H d = -g using Cholesky decomposition
         try:
-            direction = -np.linalg.solve(hessian, grad)
+            # Add small regularization for numerical stability
+            hessian_reg = hessian + self.eps * np.eye(self.n_params)
+            L = np.linalg.cholesky(hessian_reg)
+            y = np.linalg.solve(L, -grad)
+            direction = np.linalg.solve(L.T, y)
         except np.linalg.LinAlgError:
-            # Fall back to gradient descent if Hessian is singular
-            warnings.warn("Hessian near singular, using gradient direction")
-            direction = -grad
+            # Fall back to pseudoinverse if Hessian is singular
+            warnings.warn("Hessian is singular, using pseudoinverse")
+            direction = -np.linalg.pinv(hessian) @ grad
         
         return direction
     
     def line_search(self, theta: np.ndarray, direction: np.ndarray,
+                   grad: Optional[np.ndarray] = None,
                    alpha_init: float = 1.0) -> float:
         """
         Backtracking line search for Newton-CG.
@@ -501,6 +492,8 @@ class GPUObjectiveFP64(MLEObjectiveBase):
             Current parameters
         direction : np.ndarray
             Search direction
+        grad : np.ndarray or None
+            Current gradient
         alpha_init : float
             Initial step size
             
@@ -509,35 +502,36 @@ class GPUObjectiveFP64(MLEObjectiveBase):
         float
             Optimal step size
         """
-        # Armijo backtracking parameters
+        if grad is None:
+            grad = self.compute_gradient(theta)
+        
+        # Armijo parameters
         c1 = 1e-4
-        backtrack = 0.5
+        rho = 0.5
         
-        # Current objective value
+        # Initial objective and directional derivative
         f0 = self.compute_objective(theta)
+        df0 = np.dot(grad, direction)
         
-        # Gradient in search direction
-        grad = self.compute_gradient(theta)
-        slope = np.dot(grad, direction)
-        
+        # Backtracking line search
         alpha = alpha_init
+        max_iter = 20
         
-        # Backtracking loop
-        for _ in range(20):  # Max iterations
+        for _ in range(max_iter):
             theta_new = theta + alpha * direction
             f_new = self.compute_objective(theta_new)
             
             # Armijo condition
-            if f_new <= f0 + c1 * alpha * slope:
-                break
+            if f_new <= f0 + c1 * alpha * df0:
+                return alpha
             
-            alpha *= backtrack
+            alpha *= rho
         
         return alpha
     
     def extract_parameters(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
         """
-        Extract mean, covariance, and log-likelihood.
+        Extract mean and covariance from parameter vector.
         
         Parameters
         ----------
@@ -575,7 +569,7 @@ class GPUObjectiveFP64(MLEObjectiveBase):
         grad : np.ndarray or None
             Current gradient
         tol : float
-            Convergence tolerance (tight for FP64)
+            Convergence tolerance (tighter for FP64)
             
         Returns
         -------
@@ -585,7 +579,7 @@ class GPUObjectiveFP64(MLEObjectiveBase):
         if grad is None:
             grad = self.compute_gradient(theta)
         
-        # Tight tolerance for FP64
+        # Tighter tolerance for FP64
         max_grad = np.max(np.abs(grad))
         return max_grad < tol
     
@@ -593,32 +587,35 @@ class GPUObjectiveFP64(MLEObjectiveBase):
         """Get GPU device information."""
         torch = self.torch
         
-        props = torch.cuda.get_device_properties(self.device)
-        
         info = {
             'device': str(self.device),
             'dtype': 'float64',
-            'gpu_name': props.name,
-            'memory_total': props.total_memory,
-            'memory_allocated': torch.cuda.memory_allocated(self.device),
-            'multiprocessor_count': props.multi_processor_count,
-            'using_compiled': self.use_compiled,
-            'supports_newton_cg': True
+            'using_compiled': self.use_compiled
         }
         
-        # Check if this is a data center GPU
-        gpu_name_upper = props.name.upper()
-        is_datacenter = any(
-            model in gpu_name_upper
-            for model in ['A100', 'A800', 'H100', 'H800', 'V100']
-        )
-        info['is_datacenter_gpu'] = is_datacenter
-        
-        if not is_datacenter:
-            info['warning'] = 'This GPU may have poor FP64 performance'
+        if self.device.type == 'cuda':
+            info.update({
+                'gpu_name': torch.cuda.get_device_name(self.device),
+                'memory_allocated': torch.cuda.memory_allocated(self.device),
+                'memory_reserved': torch.cuda.memory_reserved(self.device),
+                'fp64_capable': True
+            })
         
         return info
     
     def clear_cache(self) -> None:
         """Clear GPU memory cache."""
-        self.torch.cuda.empty_cache()
+        if self.device.type == 'cuda':
+            self.torch.cuda.empty_cache()
+    
+    def to_cpu(self) -> 'CPUObjectiveFP64':
+        """
+        Convert to CPU objective for comparison.
+        
+        Returns
+        -------
+        CPUObjectiveFP64
+            Equivalent CPU objective
+        """
+        from .cpu_fp64_objective import CPUObjectiveFP64
+        return CPUObjectiveFP64(self.original_data)

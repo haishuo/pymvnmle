@@ -30,7 +30,7 @@ class GPUObjectiveFP32(MLEObjectiveBase):
     def __init__(self, data: np.ndarray, 
                  device: Optional[str] = None,
                  validate: bool = True,
-                 compile_objective: bool = True):
+                 compile_objective: bool = False):  # DISABLED due to trace issues
         """
         Initialize GPU FP32 objective.
         
@@ -44,6 +44,7 @@ class GPUObjectiveFP32(MLEObjectiveBase):
             Whether to validate input data
         compile_objective : bool
             Whether to compile objective with torch.compile for speed
+            (DISABLED by default due to trace operation issues)
         """
         # Initialize base class (handles preprocessing)
         super().__init__(data, validate)
@@ -72,16 +73,13 @@ class GPUObjectiveFP32(MLEObjectiveBase):
         # Transfer pattern data to GPU
         self._prepare_gpu_data()
         
-        # Compile objective for performance
-        if compile_objective and hasattr(torch, 'compile'):
-            try:
-                self._compiled_objective = torch.compile(self._torch_objective)
-                self.use_compiled = True
-            except:
-                self.use_compiled = False
-                warnings.warn("Failed to compile objective, using eager mode")
-        else:
-            self.use_compiled = False
+        # Disable compilation due to trace backward issues
+        self.use_compiled = False
+        if compile_objective:
+            warnings.warn(
+                "torch.compile is disabled for GPU objectives due to trace operation compatibility issues",
+                RuntimeWarning
+            )
     
     def _select_device(self, requested_device: Optional[str]) -> Any:
         """Select appropriate GPU device."""
@@ -121,9 +119,8 @@ class GPUObjectiveFP32(MLEObjectiveBase):
                 )
             }
             
-            # Precompute centered data for efficiency
+            # Store number of observed variables
             if len(pattern.observed_indices) > 0:
-                # Will subtract mean later
                 gpu_pattern['n_observed'] = len(pattern.observed_indices)
             else:
                 gpu_pattern['n_observed'] = 0
@@ -191,7 +188,7 @@ class GPUObjectiveFP32(MLEObjectiveBase):
         Returns
         -------
         torch.Tensor
-            Scalar objective value
+            Scalar objective value (-2 * log-likelihood for R compatibility)
         """
         torch = self.torch
         
@@ -226,13 +223,17 @@ class GPUObjectiveFP32(MLEObjectiveBase):
             # Weight by number of observations
             obj_value = obj_value + gpu_pattern['n_obs'] * contrib
         
-        return obj_value.squeeze()
+        # CRITICAL: Multiply by 2 for R compatibility (-2 * log-likelihood)
+        return 2.0 * obj_value.squeeze()
     
     def _compute_pattern_contribution_gpu(self, pattern: Dict, 
                                          mu_k: Any, 
                                          sigma_k: Any) -> Any:
         """
         Compute pattern contribution on GPU.
+        
+        Uses R-compatible formula: n_k * [const + log|Σ| + tr(Σ⁻¹S)]
+        where S is the sample covariance matrix.
         
         Parameters
         ----------
@@ -246,16 +247,17 @@ class GPUObjectiveFP32(MLEObjectiveBase):
         Returns
         -------
         torch.Tensor
-            Pattern contribution to objective
+            Pattern contribution to objective (total, not per observation)
         """
         torch = self.torch
         
+        n_obs = pattern['n_obs']
         n_obs_vars = pattern['n_observed']
         
-        # Constant term
-        const_term = n_obs_vars * self.log_2pi_gpu
+        # Constant term for all observations in this pattern
+        const_term = n_obs * n_obs_vars * self.log_2pi_gpu
         
-        # Log determinant using Cholesky
+        # Log determinant term for all observations
         try:
             L_k = torch.linalg.cholesky(sigma_k)
             log_det = 2.0 * torch.sum(torch.log(torch.diag(L_k)))
@@ -265,24 +267,30 @@ class GPUObjectiveFP32(MLEObjectiveBase):
             eigenvals = torch.clamp(eigenvals, min=self.eps)
             log_det = torch.sum(torch.log(eigenvals))
         
-        # Compute sample covariance
-        data_centered = pattern['data'] - mu_k
-        S_k = (data_centered.T @ data_centered) / pattern['n_obs']
+        log_det_term = n_obs * log_det
+        
+        # Compute sample covariance matrix (R-style)
+        data_centered = pattern['data'] - mu_k  # shape: (n_obs, n_observed)
+        S_k = (data_centered.T @ data_centered) / n_obs
         
         # Trace term: tr(Σ_k^-1 * S_k)
-        # More stable than explicit inverse for FP32
         try:
-            # Solve Σ_k * X = S_k, then tr(X)
+            # Solve Σ_k * X = S_k for X, then tr(X) = tr(Σ_k^-1 * S_k)
             X = torch.linalg.solve(sigma_k, S_k)
             trace_term = torch.trace(X)
         except:
-            # Use Cholesky solve if regular solve fails
+            # Fallback using Cholesky solve
             L_k = torch.linalg.cholesky(sigma_k)
             Y = torch.linalg.solve_triangular(L_k, S_k, upper=False)
-            X = torch.linalg.solve_triangular(L_k.T, Y, upper=True)
-            trace_term = torch.trace(X)
+            Z = torch.linalg.solve_triangular(L_k.T, Y, upper=True)
+            trace_term = torch.trace(Z)
         
-        return const_term + log_det + trace_term
+        trace_term = n_obs * trace_term
+        
+        # Total contribution (not averaged)
+        total_contribution = const_term + log_det_term + trace_term
+        
+        return total_contribution / n_obs  # Return per-observation average for consistency
     
     def _unpack_gpu(self, theta_gpu: Any) -> Tuple[Any, Any]:
         """
@@ -351,66 +359,37 @@ class GPUObjectiveFP32(MLEObjectiveBase):
             requires_grad=True
         )
         
-        # Compute objective
+        # Compute objective (never use compiled version for gradients)
         obj_value = self._torch_objective(theta_gpu)
         
         # Compute gradient via autodiff
         obj_value.backward()
         
-        # Extract gradient and convert to NumPy
-        grad = theta_gpu.grad.cpu().numpy()
-        
-        return grad
+        # Return as NumPy array
+        return theta_gpu.grad.cpu().numpy()
     
-    def compute_hessian_vector_product(self, theta: np.ndarray, 
-                                      vector: np.ndarray) -> np.ndarray:
+    def compute_hessian(self, theta: np.ndarray) -> np.ndarray:
         """
-        Compute Hessian-vector product using autodiff.
+        Hessian not implemented for FP32 (use BFGS instead).
         
         Parameters
         ----------
         theta : np.ndarray
             Parameter vector
-        vector : np.ndarray
-            Vector to multiply with Hessian
             
         Returns
         -------
         np.ndarray
-            Hessian-vector product
-            
-        Notes
-        -----
-        More efficient than computing full Hessian for BFGS.
-        Uses automatic differentiation twice.
+            Raises NotImplementedError
         """
-        torch = self.torch
-        
-        # Convert to GPU tensors
-        theta_gpu = torch.tensor(
-            theta,
-            device=self.device,
-            dtype=self.dtype,
-            requires_grad=True
+        raise NotImplementedError(
+            "Hessian computation not implemented for FP32. "
+            "Use BFGS optimization which only requires gradients."
         )
-        vector_gpu = torch.tensor(
-            vector,
-            device=self.device,
-            dtype=self.dtype
-        )
-        
-        # Compute gradient
-        obj_value = self._torch_objective(theta_gpu)
-        grad = torch.autograd.grad(obj_value, theta_gpu, create_graph=True)[0]
-        
-        # Compute Hessian-vector product
-        hvp = torch.autograd.grad(grad, theta_gpu, grad_outputs=vector_gpu)[0]
-        
-        return hvp.cpu().numpy()
     
     def extract_parameters(self, theta: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
         """
-        Extract mean, covariance, and log-likelihood.
+        Extract mean and covariance from parameter vector.
         
         Parameters
         ----------

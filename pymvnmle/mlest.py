@@ -13,19 +13,19 @@ import numpy as np
 import warnings
 import time
 from typing import Optional, Tuple, Union
-from pymvnmle._objectives import get_objective
-
-# Import precision detector
-from pymvnmle._backends.precision_detector import detect_gpu_capabilities
-
-# Import backend selector
-from pymvnmle._backends import get_backend
 
 # Import data structures
 from pymvnmle.data_structures import MLResult
 
 # Import pattern analysis
 from pymvnmle.patterns import analyze_patterns
+
+# Import scipy optimizer wrappers  
+from pymvnmle._scipy_optimizers import (
+    optimize_with_scipy,
+    validate_method,
+    auto_select_method
+)
 
 
 def _backend_method_selection(
@@ -37,13 +37,13 @@ def _backend_method_selection(
     """
     Select backend and method based on hardware and user preferences.
     
-    CRITICAL: backend='auto' defaults to 'cpu' for R compatibility.
-    GPU must be explicitly requested.
+    CRITICAL: 'auto' and default always select CPU.
+    GPU must be explicitly requested with backend='gpu'.
     
     Parameters
     ----------
     backend : str
-        Requested backend ('auto', 'cpu', 'gpu')
+        Requested backend ('cpu', 'gpu', or legacy 'auto')
     method : str
         Requested method ('auto', 'BFGS', etc.)
     gpu64 : bool
@@ -54,75 +54,73 @@ def _backend_method_selection(
     Returns
     -------
     tuple
-        (selected_backend, selected_method, backend_obj)
+        (selected_backend, selected_method)
     """
     backend_lower = backend.lower()
     
-    # CRITICAL FIX: Auto should default to CPU for R compatibility
-    if backend_lower == 'auto':
-        if verbose:
-            print("Backend 'auto': defaulting to CPU for R compatibility")
+    # Import precision detector only if GPU is explicitly requested
+    gpu_caps = None
+    has_gpu = False
+    
+    # Backend selection logic - SIMPLE AND EXPLICIT
+    if backend_lower in ['auto', 'cpu', 'numpy', 'r']:
+        # Auto, CPU, and all CPU aliases always use CPU
         selected_backend = 'cpu'
-        backend_obj = None  # Not needed for scipy
-        
-    elif backend_lower in ['cpu', 'numpy', 'r']:
-        selected_backend = 'cpu'
-        backend_obj = None
-        
+        if verbose and backend_lower == 'auto':
+            print("Backend 'auto': Using CPU (default)")
+        elif verbose:
+            print(f"Backend '{backend}': Using CPU")
+            
     elif backend_lower in ['gpu', 'cuda', 'metal', 'pytorch']:
-        # Check if GPU is available
+        # GPU explicitly requested - check availability
         try:
+            from pymvnmle._backends.precision_detector import detect_gpu_capabilities
             gpu_caps = detect_gpu_capabilities()
-            if gpu_caps.has_gpu:
-                selected_backend = 'gpu_fp64' if gpu64 else 'gpu_fp32'
-                backend_obj = None
-                if verbose:
-                    print(f"GPU backend selected: {selected_backend}")
-                    print(f"Device: {gpu_caps.device_name}")
-                    print("Note: GPU uses different parameterization (standard Cholesky)")
-            else:
-                warnings.warn("GPU requested but not available, using CPU")
-                selected_backend = 'cpu'
-                backend_obj = None
+            has_gpu = gpu_caps.has_gpu
         except:
-            warnings.warn("Could not detect GPU, using CPU")
+            has_gpu = False
+        
+        if has_gpu:
+            selected_backend = 'gpu_fp64' if gpu64 else 'gpu_fp32'
+            if verbose:
+                print(f"GPU backend selected: {selected_backend}")
+                if gpu_caps:
+                    if hasattr(gpu_caps, 'device_name'):
+                        print(f"Device: {gpu_caps.device_name}")
+                    else:
+                        print(f"Device: CUDA GPU detected")
+                    if gpu64:
+                        if hasattr(gpu_caps, 'fp64_ratio') and gpu_caps.fp64_ratio and gpu_caps.fp64_ratio < 1.0:
+                            print(f"WARNING: FP64 performance ratio: {gpu_caps.fp64_ratio:.1%} of FP32")
+        else:
+            warnings.warn(
+                f"GPU backend '{backend}' requested but no GPU detected, falling back to CPU",
+                RuntimeWarning
+            )
             selected_backend = 'cpu'
-            backend_obj = None
+            
     else:
-        raise ValueError(f"Unknown backend: {backend}")
+        raise ValueError(f"Unknown backend: {backend}. Use 'cpu' or 'gpu'")
     
     # Method selection based on backend
     method_upper = method.upper() if method else 'AUTO'
     
     if method_upper == 'AUTO':
-        if selected_backend == 'cpu':
-            selected_method = 'BFGS'
-        elif 'gpu' in selected_backend:
-            # For GPU, could use Newton-CG if Hessian available
-            selected_method = 'BFGS'  # Safe default
-        else:
-            selected_method = 'BFGS'
+        # Always use BFGS for now (most robust)
+        selected_method = 'BFGS'
     else:
-        # Use requested method
         selected_method = method
     
     if verbose:
         print(f"Selected backend: {selected_backend}")
         print(f"Selected method: {selected_method}")
     
-    return selected_backend, selected_method, backend_obj
-
-# Import scipy optimizer wrappers  
-from pymvnmle._scipy_optimizers import (
-    optimize_with_scipy,
-    validate_method,
-    auto_select_method
-)
+    return selected_backend, selected_method
 
 
 def mlest(
     data: np.ndarray,
-    backend: str = 'auto',
+    backend: str = 'cpu',  # Changed default from 'auto' to 'cpu'
     gpu64: bool = False,
     method: str = 'auto',
     tol: float = 1e-6,
@@ -140,8 +138,9 @@ def mlest(
     ----------
     data : np.ndarray, shape (n_obs, n_vars)
         Data matrix with missing values as np.nan
-    backend : {'auto', 'cpu', 'gpu'}
-        Computational backend. 'auto' selects optimal based on hardware
+    backend : {'cpu', 'gpu'}
+        Computational backend. Default is 'cpu'. GPU must be explicitly requested.
+        Legacy value 'auto' is supported and maps to 'cpu'.
     gpu64 : bool
         Force FP64 precision on GPU. May be very slow on consumer GPUs
     method : {'auto', 'BFGS', 'Newton-CG', 'L-BFGS-B', 'Nelder-Mead', 'Powell'}
@@ -184,48 +183,49 @@ def mlest(
     if verbose:
         print(f"Missingness patterns: {len(patterns)} unique patterns")
         complete_cases = sum(1 for p in patterns if len(p.missing_indices) == 0)
-        print(f"Complete cases: {patterns[0].n_cases if patterns and len(patterns[0].missing_indices) == 0 else 0}/{n_obs}")
+        if patterns and len(patterns[0].missing_indices) == 0:
+            print(f"Complete cases: {patterns[0].n_cases}/{n_obs}")
+        else:
+            print(f"Complete cases: 0/{n_obs}")
     
     # Step 3: Select backend and method
-    selected_backend, selected_method, backend_obj = _backend_method_selection(
+    selected_backend, selected_method = _backend_method_selection(
         backend, method, gpu64, verbose
     )
     
     # Step 4: Create objective function based on backend
+    from pymvnmle._objectives import get_objective
+    
     try:
-        # Determine which objective to use based on backend
-        backend_name = backend_obj.name if hasattr(backend_obj, 'name') else 'numpy_fp64'
-        
-        if 'pytorch' in backend_name or 'gpu' in backend_name:
-            # GPU backend - determine precision
-            precision = backend_obj.precision if hasattr(backend_obj, 'precision') else 'fp32'
-            
-            if 'gpu' in selected_backend:
-                precision = 'fp64' if 'fp64' in selected_backend else 'fp32'
-                objective = get_objective(data, backend='gpu', precision=precision)
-            else:
-                objective = get_objective(data, backend='cpu')
-
-            if verbose:
-                print(f"Using GPU objective with {precision} precision")
-                
+        # Map backend selection to objective parameters
+        if selected_backend == 'cpu':
+            objective = get_objective(data, backend='cpu')
+        elif selected_backend == 'gpu_fp32':
+            objective = get_objective(data, backend='gpu', precision='fp32')
+        elif selected_backend == 'gpu_fp64':
+            objective = get_objective(data, backend='gpu', precision='fp64')
         else:
-            # CPU backend
-            from pymvnmle._objectives.cpu_fp64_objective import CPUObjectiveFP64
-            objective = CPUObjectiveFP64(data)
+            raise ValueError(f"Unknown backend: {selected_backend}")
             
-            if verbose:
-                print("Using CPU objective with fp64 precision")
-                
-    except ImportError as e:
-        # Fallback to CPU if GPU objective not available
         if verbose:
-            print(f"GPU objective not available: {e}, falling back to CPU")
-        from pymvnmle._objectives.cpu_fp64_objective import CPUObjectiveFP64
-        objective = CPUObjectiveFP64(data)
-        selected_backend = 'cpu'  # Update for result
+            device_info = objective.get_device_info() if hasattr(objective, 'get_device_info') else {}
+            if device_info:
+                print(f"Objective created on: {device_info.get('device', 'unknown')}")
+                if 'gpu_name' in device_info:
+                    print(f"GPU: {device_info['gpu_name']}")
+                    
+    except ImportError as e:
+        if 'gpu' in selected_backend:
+            warnings.warn(
+                f"Failed to create GPU objective: {e}. Falling back to CPU.",
+                RuntimeWarning
+            )
+            selected_backend = 'cpu'
+            objective = get_objective(data, backend='cpu')
+        else:
+            raise
     except Exception as e:
-        raise RuntimeError(f"Failed to create objective: {e}")
+        raise RuntimeError(f"Failed to create objective function: {e}")
     
     if verbose:
         print("-" * 60)
@@ -293,7 +293,7 @@ def mlest(
         print(f"  Converged: {result['converged']}")
         print(f"  Iterations: {result['n_iter']}")
         print(f"  Function evaluations: {result['n_fev']}")
-        if result['n_jev']:
+        if result.get('n_jev'):
             print(f"  Gradient evaluations: {result['n_jev']}")
         print(f"  Final gradient norm: {result['grad_norm']:.2e}")
         print(f"  Log-likelihood: {final_loglik:.6f}")

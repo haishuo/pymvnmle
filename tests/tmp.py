@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple direct comparison of CPU vs GPU optimization.
+Diagnostic to identify the gradient computation issue in GPU implementation.
 """
 
 import numpy as np
@@ -9,191 +9,167 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pymvnmle import mlest
-from scipy.optimize import minimize
+from pymvnmle._objectives import get_objective
 
 
-def simple_convergence_test():
-    """Simple test to check convergence behavior."""
+def diagnose_gradient_issue():
+    """Diagnose the gradient scaling/computation issue."""
     
     print("=" * 70)
-    print("SIMPLE CONVERGENCE TEST")
+    print("GRADIENT COMPUTATION DIAGNOSTIC")
     print("=" * 70)
     
-    # Generate simple test data
+    # Very simple test case
     np.random.seed(42)
-    n_obs, n_vars = 500, 5
+    n_obs, n_vars = 100, 3  # Very small for detailed analysis
     
-    # True parameters
-    true_mu = np.arange(1, n_vars + 1, dtype=float)
-    true_sigma = np.eye(n_vars) + 0.3  # Simple covariance
-    
-    # Generate complete data first (no missing)
-    from scipy.stats import multivariate_normal
-    data = multivariate_normal.rvs(mean=true_mu, cov=true_sigma, size=n_obs)
+    # Simple data - identity covariance
+    data = np.random.randn(n_obs, n_vars)
     
     print(f"\nTest data: {n_obs}×{n_vars} (COMPLETE - no missing)")
-    print(f"True μ: {true_mu}")
-    print(f"True Σ diagonal: {np.diag(true_sigma)}")
+    print(f"Parameters: {n_vars + n_vars*(n_vars+1)//2} = {3 + 6}")
     
-    # Test 1: Complete data (should give very similar results)
-    print("\n" + "=" * 70)
-    print("TEST 1: COMPLETE DATA")
-    print("=" * 70)
+    # Create objectives
+    cpu_obj = get_objective(data, backend='cpu')
+    gpu_obj = get_objective(data, backend='gpu', precision='fp32')
     
-    print("\nCPU optimization...")
-    cpu_result = mlest(data, method='BFGS', backend='cpu', verbose=False)
-    
-    print(f"CPU converged: {cpu_result.converged} in {cpu_result.n_iter} iterations")
-    print(f"CPU μ[0:3]: {cpu_result.muhat[:3]}")
-    print(f"CPU Σ[0,0]: {cpu_result.sigmahat[0,0]:.6f}")
-    print(f"CPU log-lik: {cpu_result.log_likelihood:.6f}")
-    
-    print("\nGPU optimization...")
-    gpu_result = mlest(data, method='BFGS', backend='gpu', verbose=False)
-    
-    print(f"GPU converged: {gpu_result.converged} in {gpu_result.n_iter} iterations")
-    print(f"GPU μ[0:3]: {gpu_result.muhat[:3]}")
-    print(f"GPU Σ[0,0]: {gpu_result.sigmahat[0,0]:.6f}")
-    print(f"GPU log-lik: {gpu_result.log_likelihood:.6f}")
-    
-    print(f"\nDifferences (complete data):")
-    print(f"  Max μ diff: {np.max(np.abs(cpu_result.muhat - gpu_result.muhat)):.2e}")
-    print(f"  Max Σ diff: {np.max(np.abs(cpu_result.sigmahat - gpu_result.sigmahat)):.2e}")
-    
-    # Test 2: Add 5% missing
-    print("\n" + "=" * 70)
-    print("TEST 2: WITH 5% MISSING DATA")
-    print("=" * 70)
-    
-    data_missing = data.copy()
-    mask = np.random.random(data.shape) < 0.05
-    data_missing[mask] = np.nan
-    print(f"\nMissing: {np.sum(mask)}/{data.size} ({100*np.sum(mask)/data.size:.1f}%)")
-    
-    print("\nCPU optimization...")
-    cpu_result2 = mlest(data_missing, method='BFGS', backend='cpu', verbose=False)
-    
-    print(f"CPU converged: {cpu_result2.converged} in {cpu_result2.n_iter} iterations")
-    print(f"CPU μ[0:3]: {cpu_result2.muhat[:3]}")
-    print(f"CPU Σ[0,0]: {cpu_result2.sigmahat[0,0]:.6f}")
-    print(f"CPU log-lik: {cpu_result2.log_likelihood:.6f}")
-    
-    print("\nGPU optimization...")
-    gpu_result2 = mlest(data_missing, method='BFGS', backend='gpu', verbose=False)
-    
-    print(f"GPU converged: {gpu_result2.converged} in {gpu_result2.n_iter} iterations")
-    print(f"GPU μ[0:3]: {gpu_result2.muhat[:3]}")
-    print(f"GPU Σ[0,0]: {gpu_result2.sigmahat[0,0]:.6f}")
-    print(f"GPU log-lik: {gpu_result2.log_likelihood:.6f}")
-    
-    print(f"\nDifferences (5% missing):")
-    print(f"  Max μ diff: {np.max(np.abs(cpu_result2.muhat - gpu_result2.muhat)):.2e}")
-    print(f"  Max Σ diff: {np.max(np.abs(cpu_result2.sigmahat - gpu_result2.sigmahat)):.2e}")
-    
-    # Test 3: Try with different tolerances
-    print("\n" + "=" * 70)
-    print("TEST 3: TOLERANCE SENSITIVITY (5% missing)")
-    print("=" * 70)
-    
-    for tol in [1e-4, 1e-6, 1e-8]:
-        print(f"\n--- Tolerance = {tol:.0e} ---")
-        
-        cpu_tol = mlest(data_missing, method='BFGS', backend='cpu', 
-                       tol=tol, max_iter=200, verbose=False)
-        gpu_tol = mlest(data_missing, method='BFGS', backend='gpu',
-                       tol=tol, max_iter=200, verbose=False)
-        
-        print(f"CPU: {cpu_tol.n_iter} iterations")
-        print(f"GPU: {gpu_tol.n_iter} iterations")
-        print(f"Max Σ diff: {np.max(np.abs(cpu_tol.sigmahat - gpu_tol.sigmahat)):.2e}")
-    
-    # Test 4: Direct scipy minimize comparison
-    print("\n" + "=" * 70)
-    print("TEST 4: DIRECT SCIPY MINIMIZE")
-    print("=" * 70)
-    
-    from pymvnmle._objectives import get_objective
-    from pymvnmle._objectives.parameterizations import (
-        InverseCholeskyParameterization,
-        CholeskyParameterization
-    )
-    
-    cpu_obj = get_objective(data_missing, backend='cpu')
-    gpu_obj = get_objective(data_missing, backend='gpu', precision='fp32')
-    
+    # Get initial parameters
     x0_cpu = cpu_obj.get_initial_parameters()
     x0_gpu = gpu_obj.get_initial_parameters()
     
-    print("\nDirect scipy.optimize.minimize with BFGS:")
+    print(f"\nInitial parameter norm difference: {np.linalg.norm(x0_cpu - x0_gpu):.2e}")
     
-    # CPU optimization
-    print("\nCPU (scipy direct):")
-    res_cpu = minimize(
-        cpu_obj.compute_objective,
-        x0_cpu,
-        method='BFGS',
-        jac=cpu_obj.compute_gradient,
-        options={'gtol': 1e-6, 'maxiter': 200}
-    )
-    print(f"  Success: {res_cpu.success}")
-    print(f"  Iterations: {res_cpu.nit}")
-    print(f"  Final objective: {res_cpu.fun:.6f}")
-    
-    # GPU optimization  
-    print("\nGPU (scipy direct):")
-    res_gpu = minimize(
-        gpu_obj.compute_objective,
-        x0_gpu,
-        method='BFGS',
-        jac=gpu_obj.compute_gradient,
-        options={'gtol': 1e-6, 'maxiter': 200}
-    )
-    print(f"  Success: {res_gpu.success}")
-    print(f"  Iterations: {res_gpu.nit}")
-    print(f"  Final objective: {res_gpu.fun:.6f}")
-    
-    # Extract and compare parameters
-    cpu_param = InverseCholeskyParameterization(n_vars)
-    gpu_param = CholeskyParameterization(n_vars)
-    
-    mu_cpu, sigma_cpu, _ = cpu_obj.extract_parameters(res_cpu.x)
-    mu_gpu, sigma_gpu, _ = gpu_obj.extract_parameters(res_gpu.x)
-    
-    print(f"\nFinal parameter differences (scipy direct):")
-    print(f"  Max μ diff: {np.max(np.abs(mu_cpu - mu_gpu)):.2e}")
-    print(f"  Max Σ diff: {np.max(np.abs(sigma_cpu - sigma_gpu)):.2e}")
-    
-    # Show actual Sigma values
+    # Test 1: Compare objectives at same point
     print("\n" + "=" * 70)
-    print("ACTUAL SIGMA VALUES")
+    print("TEST 1: OBJECTIVE VALUES AT INITIAL POINT")
     print("=" * 70)
     
-    print("\nTrue Σ:")
-    print(true_sigma)
+    obj_cpu_at_cpu = cpu_obj.compute_objective(x0_cpu)
+    obj_gpu_at_gpu = gpu_obj.compute_objective(x0_gpu)
     
-    print("\nCPU Σ:")
-    print(sigma_cpu)
+    print(f"CPU objective at CPU's x0: {obj_cpu_at_cpu:.6f}")
+    print(f"GPU objective at GPU's x0: {obj_gpu_at_gpu:.6f}")
+    print(f"Difference: {abs(obj_cpu_at_cpu - obj_gpu_at_gpu):.2e}")
     
-    print("\nGPU Σ:")
-    print(sigma_gpu)
-    
-    print("\nDifference (CPU - GPU):")
-    print(sigma_cpu - sigma_gpu)
-    
-    # Check condition numbers
+    # Test 2: Compare gradients at initial point
     print("\n" + "=" * 70)
-    print("CONDITION NUMBERS")
+    print("TEST 2: GRADIENTS AT INITIAL POINT")
     print("=" * 70)
     
-    print(f"True Σ condition number: {np.linalg.cond(true_sigma):.2e}")
-    print(f"CPU Σ condition number: {np.linalg.cond(sigma_cpu):.2e}")
-    print(f"GPU Σ condition number: {np.linalg.cond(sigma_gpu):.2e}")
+    grad_cpu = cpu_obj.compute_gradient(x0_cpu)
+    grad_gpu = gpu_obj.compute_gradient(x0_gpu)
     
+    print(f"CPU gradient shape: {grad_cpu.shape}")
+    print(f"GPU gradient shape: {grad_gpu.shape}")
+    print(f"CPU gradient norm: {np.linalg.norm(grad_cpu):.6f}")
+    print(f"GPU gradient norm: {np.linalg.norm(grad_gpu):.6f}")
+    print(f"Ratio (GPU/CPU): {np.linalg.norm(grad_gpu)/np.linalg.norm(grad_cpu):.2f}")
+    
+    # Show first few components
+    print(f"\nFirst 5 gradient components:")
+    print(f"CPU: {grad_cpu[:5]}")
+    print(f"GPU: {grad_gpu[:5]}")
+    print(f"Ratio: {grad_gpu[:5]/grad_cpu[:5]}")
+    
+    # Test 3: Finite difference check for GPU
     print("\n" + "=" * 70)
-    print("TEST COMPLETE")
+    print("TEST 3: FINITE DIFFERENCE VALIDATION")
     print("=" * 70)
+    
+    # Check GPU gradient with finite differences
+    eps = 1e-6
+    fd_grad = np.zeros_like(grad_gpu)
+    
+    for i in range(min(5, len(x0_gpu))):  # Check first 5 components
+        x_plus = x0_gpu.copy()
+        x_plus[i] += eps
+        
+        x_minus = x0_gpu.copy()
+        x_minus[i] -= eps
+        
+        f_plus = gpu_obj.compute_objective(x_plus)
+        f_minus = gpu_obj.compute_objective(x_minus)
+        
+        fd_grad[i] = (f_plus - f_minus) / (2 * eps)
+    
+    print(f"\nGPU gradient vs finite differences (first 5 components):")
+    print(f"Autodiff:  {grad_gpu[:5]}")
+    print(f"Finite diff: {fd_grad[:5]}")
+    print(f"Relative error: {np.abs(grad_gpu[:5] - fd_grad[:5])/np.abs(grad_gpu[:5] + 1e-10)}")
+    
+    # Test 4: Check if gradients point in same direction
+    print("\n" + "=" * 70)
+    print("TEST 4: GRADIENT DIRECTION ANALYSIS")
+    print("=" * 70)
+    
+    # Normalize gradients
+    grad_cpu_normalized = grad_cpu / (np.linalg.norm(grad_cpu) + 1e-10)
+    grad_gpu_normalized = grad_gpu / (np.linalg.norm(grad_gpu) + 1e-10)
+    
+    # Cosine similarity
+    cosine_sim = np.dot(grad_cpu_normalized, grad_gpu_normalized)
+    print(f"Cosine similarity between gradients: {cosine_sim:.4f}")
+    
+    if cosine_sim < 0.9:
+        print("⚠️ WARNING: Gradients pointing in different directions!")
+    elif cosine_sim > 0.99:
+        print("✓ Gradients point in same direction (likely just scaling issue)")
+    
+    # Test 5: Pattern-by-pattern analysis
+    print("\n" + "=" * 70)
+    print("TEST 5: PARAMETER STRUCTURE ANALYSIS")
+    print("=" * 70)
+    
+    # Split parameters into mean and covariance parts
+    print(f"\nParameter structure (total {len(x0_cpu)} params):")
+    print(f"  Mean parameters: 0 to {n_vars-1} (n={n_vars})")
+    print(f"  Cov parameters: {n_vars} to {len(x0_cpu)-1} (n={len(x0_cpu)-n_vars})")
+    
+    grad_cpu_mean = grad_cpu[:n_vars]
+    grad_cpu_cov = grad_cpu[n_vars:]
+    
+    grad_gpu_mean = grad_gpu[:n_vars]
+    grad_gpu_cov = grad_gpu[n_vars:]
+    
+    print(f"\nMean gradient norms:")
+    print(f"  CPU: {np.linalg.norm(grad_cpu_mean):.6f}")
+    print(f"  GPU: {np.linalg.norm(grad_gpu_mean):.6f}")
+    print(f"  Ratio: {np.linalg.norm(grad_gpu_mean)/np.linalg.norm(grad_cpu_mean):.2f}")
+    
+    print(f"\nCovariance gradient norms:")
+    print(f"  CPU: {np.linalg.norm(grad_cpu_cov):.6f}")
+    print(f"  GPU: {np.linalg.norm(grad_gpu_cov):.6f}")
+    print(f"  Ratio: {np.linalg.norm(grad_gpu_cov)/np.linalg.norm(grad_cpu_cov):.2f}")
+    
+    # Test 6: Check for NaN or Inf
+    print("\n" + "=" * 70)
+    print("TEST 6: NUMERICAL STABILITY CHECK")
+    print("=" * 70)
+    
+    print(f"CPU gradient has NaN: {np.any(np.isnan(grad_cpu))}")
+    print(f"CPU gradient has Inf: {np.any(np.isinf(grad_cpu))}")
+    print(f"GPU gradient has NaN: {np.any(np.isnan(grad_gpu))}")
+    print(f"GPU gradient has Inf: {np.any(np.isinf(grad_gpu))}")
+    
+    # Summary
+    print("\n" + "=" * 70)
+    print("DIAGNOSTIC SUMMARY")
+    print("=" * 70)
+    
+    if np.linalg.norm(grad_gpu) > np.linalg.norm(grad_cpu) * 10:
+        print("\n🔴 CRITICAL: GPU gradient is an order of magnitude larger!")
+        print("   Likely causes:")
+        print("   1. Missing normalization factor (e.g., 1/n)")
+        print("   2. Different parameterization Jacobian not accounted for")
+        print("   3. Accumulation without averaging in batched computation")
+        
+        # Check if it's a simple scaling
+        ratio = np.linalg.norm(grad_gpu) / np.linalg.norm(grad_cpu)
+        if abs(ratio - n_obs) < 1:
+            print(f"\n   💡 Ratio ≈ n_obs ({n_obs}) - missing 1/n normalization?")
+        elif abs(ratio - np.sqrt(n_obs)) < 1:
+            print(f"\n   💡 Ratio ≈ sqrt(n_obs) ({np.sqrt(n_obs):.1f}) - missing 1/sqrt(n) normalization?")
 
 
 if __name__ == "__main__":
-    simple_convergence_test()
+    diagnose_gradient_issue()

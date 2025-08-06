@@ -10,29 +10,25 @@ Date: January 2025
 License: MIT
 """
 
-import numpy as np  # Add numpy import for benchmark_performance
+import numpy as np
 
 __version__ = "2.0.0"
 __author__ = "Statistical Software Engineer"
 __license__ = "MIT"
 
-# Core functionality
-from .mlest import (
-    mlest,
-    ml_estimate,  # Backward compatibility alias
-    maximum_likelihood_estimate  # Backward compatibility alias
-)
+# Core functionality - ONLY import what exists
+from .mlest import mlest
 
 # Data structures
 from .data_structures import MLResult
 
 # Pattern analysis
 from .patterns import analyze_patterns, pattern_summary
+
 # Try to import get_pattern_matrix if it exists
 try:
     from .patterns import get_pattern_matrix
 except ImportError:
-    # Function might not exist or have different name
     get_pattern_matrix = None
 
 # Statistical tests
@@ -49,41 +45,48 @@ from ._backends import (
     BackendFactory
 )
 
-# Try to import PrecisionDetector - might have different names in actual implementation
+# Try to import PrecisionDetector
 try:
-    from ._backends.precision_detector import PrecisionDetector
-    detect_hardware_capabilities = PrecisionDetector().detect_gpu
-except (ImportError, AttributeError):
-    # Fallback if the module structure is different
-    try:
-        # Maybe it's called something else
-        from ._backends.precision_detector import GPUDetector as PrecisionDetector
-        detect_hardware_capabilities = PrecisionDetector().detect_gpu
-    except ImportError:
-        # Final fallback - create dummy detector
-        class PrecisionDetector:
-            def detect_gpu(self):
-                return {
-                    'gpu_type': 'none',
-                    'fp64_support': 'none', 
-                    'device_name': 'None'
-                }
-        
-        def detect_hardware_capabilities():
-            return PrecisionDetector().detect_gpu()
+    from ._backends.precision_detector import detect_gpu_capabilities
+    HAS_GPU_DETECTION = True
+except ImportError:
+    HAS_GPU_DETECTION = False
+    # Create dummy function
+    def detect_gpu_capabilities():
+        return {
+            'gpu_type': 'none',
+            'fp64_support': 'none', 
+            'device_name': 'None',
+            'has_gpu': False
+        }
 
-from ._objectives import (
-    get_objective,
-    compare_objectives,
-    benchmark_objectives
-)
+# Import objectives if available
+try:
+    from ._objectives import (
+        get_objective,
+        compare_objectives,
+        benchmark_objectives
+    )
+    HAS_OBJECTIVES = True
+except ImportError:
+    HAS_OBJECTIVES = False
+    get_objective = None
+    compare_objectives = None
+    benchmark_objectives = None
 
-from ._methods import (
-    get_optimizer,
-    auto_select_method,
-    compare_methods,
-    benchmark_convergence
-)
+# Import optimizer methods if available
+try:
+    from ._scipy_optimizers import (
+        optimize_with_scipy,
+        validate_method,
+        auto_select_method
+    )
+    HAS_OPTIMIZERS = True
+except ImportError:
+    HAS_OPTIMIZERS = False
+    optimize_with_scipy = None
+    validate_method = None
+    auto_select_method = None
 
 # Utility functions - import what's available from _utils
 try:
@@ -93,9 +96,9 @@ try:
         compute_pairwise_deletion_cov,
         check_positive_definite
     )
+    HAS_UTILS = True
 except ImportError:
-    # Some or all utilities might not exist in _utils
-    # Set them to None and they won't be exported
+    HAS_UTILS = False
     generate_mvn_data = None
     add_missing_data = None
     compute_pairwise_deletion_cov = None
@@ -110,214 +113,80 @@ def check_gpu_capabilities(verbose: bool = True) -> dict:
     Parameters
     ----------
     verbose : bool
-        Whether to print detailed information
+        Print detailed information
         
     Returns
     -------
     dict
-        Hardware capabilities including:
-        - gpu_available: Whether GPU is detected
-        - gpu_type: Type of GPU (cuda, metal, none)
-        - fp64_support: Level of FP64 support (full, gimped, none)
-        - recommended_settings: Suggested mlest() parameters
-        
-    Examples
-    --------
-    >>> import pymvnmle as pmle
-    >>> caps = pmle.check_gpu_capabilities()
-    GPU Detected: NVIDIA RTX 4090
-    FP64 Support: Gimped (1/64x speed)
-    Recommendation: Use default settings (FP32) for best performance
+        GPU capability information
     """
-    detector = PrecisionDetector()
-    info = detector.detect_gpu()
+    caps = detect_gpu_capabilities()
     
     result = {
-        'gpu_available': info['gpu_type'] != 'none',
-        'gpu_type': info['gpu_type'],
-        'gpu_name': info.get('device_name', 'None'),
-        'fp64_support': info.get('fp64_support', 'none'),
-        'fp64_ratio': info.get('fp64_ratio', None),
-        'recommended_settings': {}
+        'gpu_available': caps.get('has_gpu', False),
+        'gpu_name': caps.get('device_name', 'None'),
+        'fp64_support': caps.get('fp64_support', 'none')
     }
     
-    # Determine recommendations
-    if not result['gpu_available']:
-        result['recommended_settings'] = {
-            'backend': 'cpu',
-            'gpu64': False,
-            'method': 'BFGS'
-        }
-        recommendation = "No GPU detected. CPU computation will be used."
-        
-    elif result['fp64_support'] == 'full':
-        result['recommended_settings'] = {
-            'backend': 'auto',
-            'gpu64': True,
-            'method': 'auto'  # Will select Newton-CG
-        }
-        recommendation = "Full FP64 support! Use gpu64=True for maximum precision."
-        
-    elif result['fp64_support'] == 'gimped':
-        result['recommended_settings'] = {
-            'backend': 'auto',
-            'gpu64': False,  # Default to FP32
-            'method': 'auto'  # Will select BFGS
-        }
-        recommendation = f"Gimped FP64 (1/{result['fp64_ratio']}x speed). Use default settings (FP32) for best performance."
-        
-    else:  # No FP64 support
-        result['recommended_settings'] = {
-            'backend': 'auto',
-            'gpu64': False,
-            'method': 'auto'  # Will select BFGS
-        }
-        recommendation = "No FP64 support. FP32 will be used for GPU computation."
-    
     if verbose:
-        print(f"GPU Detected: {result['gpu_name']}")
-        print(f"FP64 Support: {result['fp64_support'].title()}", end='')
-        if result['fp64_ratio']:
-            print(f" (1/{result['fp64_ratio']}x speed)")
-        else:
-            print()
-        print(f"Recommendation: {recommendation}")
-        print(f"\nSuggested mlest() parameters:")
-        for key, value in result['recommended_settings'].items():
-            print(f"  {key}={value}")
+        print("GPU Capabilities:")
+        print(f"  Available: {result['gpu_available']}")
+        if result['gpu_available']:
+            print(f"  Device: {result['gpu_name']}")
+            print(f"  FP64 Support: {result['fp64_support']}")
     
     return result
 
 
-def benchmark_performance(
-    n_obs: int = 500,
-    n_vars: int = 10,
-    missing_rate: float = 0.2,
-    backends: list = None,
-    verbose: bool = True
-) -> dict:
+# Performance benchmarking function
+def benchmark_performance(data: np.ndarray, backends: list = None) -> dict:
     """
-    Benchmark PyMVNMLE performance across different backends.
+    Benchmark PyMVNMLE performance across backends.
     
     Parameters
     ----------
-    n_obs : int
-        Number of observations in test data
-    n_vars : int
-        Number of variables in test data
-    missing_rate : float
-        Proportion of missing values
+    data : np.ndarray
+        Test data matrix
     backends : list, optional
-        List of backends to test (default: all available)
-    verbose : bool
-        Whether to print results
+        List of backends to test. If None, tests all available
         
     Returns
     -------
     dict
-        Benchmark results for each backend
-        
-    Examples
-    --------
-    >>> import pymvnmle as pmle
-    >>> results = pmle.benchmark_performance(n_obs=1000, n_vars=20)
-    Benchmarking PyMVNMLE Performance...
-    Data: 1000 observations, 20 variables, 20.0% missing
-    
-    Backend: cpu (fp64)
-      Time: 2.34s
-      Iterations: 45
-      Log-likelihood: -28453.21
-    
-    Backend: gpu_fp32
-      Time: 0.89s (2.6x speedup)
-      Iterations: 43
-      Log-likelihood: -28453.18
+        Performance results for each backend
     """
-    if verbose:
-        print("Benchmarking PyMVNMLE Performance...")
-        print(f"Data: {n_obs} observations, {n_vars} variables, {missing_rate*100:.1f}% missing")
-        print()
+    import time
     
-    # Generate test data - import from _utils not .utils
-    try:
-        from ._utils import generate_mvn_data, add_missing_data
-    except ImportError:
-        # Functions might not exist - create simple versions
-        def generate_mvn_data(n_obs, n_vars, seed=None):
-            if seed is not None:
-                np.random.seed(seed)
-            return np.random.randn(n_obs, n_vars)
-        
-        def add_missing_data(data, missing_rate, seed=None):
-            if seed is not None:
-                np.random.seed(seed)
-            data = data.copy()
-            mask = np.random.rand(*data.shape) < missing_rate
-            data[mask] = np.nan
-            return data
-    data = generate_mvn_data(n_obs, n_vars, seed=42)
-    data = add_missing_data(data, missing_rate, seed=42)
-    
-    # Test each backend
     if backends is None:
-        backends = ['cpu', 'gpu']
+        backends = ['cpu']
+        if HAS_GPU_DETECTION and detect_gpu_capabilities().get('has_gpu', False):
+            backends.append('gpu')
     
     results = {}
-    baseline_time = None
     
     for backend in backends:
         try:
-            # Skip if backend not available
-            if backend == 'gpu':
-                detector = PrecisionDetector()
-                if detector.detect_gpu()['gpu_type'] == 'none':
-                    if verbose:
-                        print(f"Backend: {backend} - Not available")
-                        print()
-                    continue
-            
-            # Run estimation
-            import time
             start = time.time()
             result = mlest(data, backend=backend, verbose=False)
             elapsed = time.time() - start
             
             results[backend] = {
                 'time': elapsed,
-                'iterations': result.n_iter,
-                'loglik': result.loglik,
                 'converged': result.converged,
-                'backend_used': result.backend,
-                'method_used': result.method
+                'iterations': result.n_iter,
+                'loglik': result.loglik
             }
-            
-            if verbose:
-                print(f"Backend: {result.backend} ({result.method})")
-                print(f"  Time: {elapsed:.2f}s", end='')
-                if baseline_time is not None:
-                    speedup = baseline_time / elapsed
-                    print(f" ({speedup:.1f}x speedup)")
-                else:
-                    baseline_time = elapsed
-                    print()
-                print(f"  Iterations: {result.n_iter}")
-                print(f"  Log-likelihood: {result.loglik:.2f}")
-                print()
-                
         except Exception as e:
-            if verbose:
-                print(f"Backend: {backend} - Failed ({e})")
-                print()
-            results[backend] = {'error': str(e)}
+            results[backend] = {
+                'error': str(e)
+            }
     
     return results
 
 
-# Version checking utilities
+# Version checking
 def check_version():
-    """Print PyMVNMLE version and dependencies."""
-    import numpy as np
+    """Print version information for PyMVNMLE and dependencies."""
     import scipy
     print(f"PyMVNMLE: {__version__}")
     print(f"NumPy: {np.__version__}")
@@ -341,12 +210,10 @@ def check_version():
         print(f"  FP64 Support: {caps['fp64_support']}")
 
 
-# Main public API
+# Main public API - ONLY export what exists
 __all__ = [
     # Core functions
     'mlest',
-    'ml_estimate',
-    'maximum_likelihood_estimate',
     
     # Data structures
     'MLResult',
@@ -361,16 +228,15 @@ __all__ = [
     # Datasets
     'datasets',
     
-    # Backend management (new in v2.0)
+    # Backend management
     'get_backend',
     'list_available_backends',
     'benchmark_backends',
     
-    # Hardware detection (new in v2.0)
+    # Hardware detection
     'check_gpu_capabilities',
-    'detect_hardware_capabilities',
     
-    # Performance benchmarking (new in v2.0)
+    # Performance benchmarking
     'benchmark_performance',
     
     # Version info
@@ -383,22 +249,32 @@ if get_pattern_matrix is not None:
     __all__.append('get_pattern_matrix')
 
 # Add utility functions if they exist
-if generate_mvn_data is not None:
-    __all__.extend([
-        'generate_mvn_data',
-        'add_missing_data', 
-        'compute_pairwise_deletion_cov',
-        'check_positive_definite'
-    ])
+if HAS_UTILS:
+    utility_exports = []
+    if generate_mvn_data is not None:
+        utility_exports.append('generate_mvn_data')
+    if add_missing_data is not None:
+        utility_exports.append('add_missing_data')
+    if compute_pairwise_deletion_cov is not None:
+        utility_exports.append('compute_pairwise_deletion_cov')
+    if check_positive_definite is not None:
+        utility_exports.append('check_positive_definite')
+    __all__.extend(utility_exports)
 
+# Add objectives if available
+if HAS_OBJECTIVES:
+    if get_objective is not None:
+        __all__.append('get_objective')
+    if compare_objectives is not None:
+        __all__.append('compare_objectives')
+    if benchmark_objectives is not None:
+        __all__.append('benchmark_objectives')
 
-# Print hardware info on import (can be disabled)
-_SHOW_HARDWARE_ON_IMPORT = False  # Set to True for debugging
-
-if _SHOW_HARDWARE_ON_IMPORT:
-    print(f"PyMVNMLE {__version__} loaded")
-    caps = check_gpu_capabilities(verbose=False)
-    if caps['gpu_available']:
-        print(f"GPU: {caps['gpu_name']} ({caps['fp64_support']} FP64 support)")
-    else:
-        print("GPU: Not available, using CPU")
+# Add optimizer methods if available
+if HAS_OPTIMIZERS:
+    if optimize_with_scipy is not None:
+        __all__.append('optimize_with_scipy')
+    if validate_method is not None:
+        __all__.append('validate_method')
+    if auto_select_method is not None:
+        __all__.append('auto_select_method')

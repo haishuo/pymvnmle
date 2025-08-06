@@ -1,251 +1,435 @@
 """
-Abstract backend interfaces for PyMVNMLE v2.0
-Pure abstract base classes defining the computational contracts
+Base interfaces for computational backends in PyMVNMLE.
 
-DESIGN PRINCIPLE: Unix Philosophy - "Do one thing and do it well"
-This module contains ONLY abstract interface definitions. No implementation,
-no utilities, no diagnostics, no validation - just pure contracts.
-
-All concrete functionality belongs in separate, focused modules:
-- Validation → _backends/validation.py
-- Benchmarking → _backends/benchmarking.py  
-- Diagnostics → _utils/system_info.py
-- Error handling → Custom exception classes only
+Defines abstract base classes that all backends must implement.
+Separates concerns by precision level (FP32 vs FP64).
 """
 
 from abc import ABC, abstractmethod
+from typing import Tuple, Optional, Dict, Any
 import numpy as np
-from typing import Tuple, Callable
 
 
-class BackendInterface(ABC):
+class BackendBase(ABC):
     """
-    Pure abstract interface for all computational backends.
+    Abstract base class for all computational backends.
     
-    Defines the minimal contract that all backends (CPU and GPU) must implement
-    for multivariate normal maximum likelihood estimation with missing data.
-    
-    Design Principles:
-    1. Interface only - no implementation details
-    2. Minimal surface area - only essential operations
-    3. NumPy arrays at boundaries - consistent input/output types
-    4. Mathematical focus - operations needed for MLE computation
-    
-    The interface covers exactly four core mathematical operations:
-    - Cholesky decomposition (for inverse Cholesky parameterization)
-    - Triangular system solving (for likelihood computation)  
-    - Log-determinant computation (for log-likelihood evaluation)
-    - Gradient computation (finite differences or autodiff)
+    Every backend must implement these core operations.
+    No defaults - explicit implementation required.
     """
     
-    @property
+    def __init__(self, precision: str):
+        """
+        Initialize backend with precision specification.
+        
+        Parameters
+        ----------
+        precision : str
+            Either 'fp32' or 'fp64'
+        """
+        if precision not in ['fp32', 'fp64']:
+            raise ValueError(f"Invalid precision: {precision}. Must be 'fp32' or 'fp64'")
+        
+        self.precision = precision
+        self.dtype = np.float32 if precision == 'fp32' else np.float64
+    
     @abstractmethod
     def is_available(self) -> bool:
-        """Check if this backend is available on the current system."""
-        pass
-    
-    @property
-    @abstractmethod  
-    def name(self) -> str:
-        """Get the backend name."""
-        pass
-    
-    @abstractmethod
-    def gradient_method(self) -> str:
         """
-        Return the gradient computation method.
+        Check if this backend is available on current hardware.
         
         Returns
         -------
-        str
-            Either 'finite_differences' or 'autodiff'
+        bool
+            True if backend can be used
         """
-        pass
+        raise NotImplementedError
     
     @abstractmethod
-    def cholesky(self, matrix: np.ndarray, upper: bool = True) -> np.ndarray:
+    def get_device_info(self) -> Dict[str, Any]:
         """
-        Compute Cholesky decomposition of positive definite matrix.
+        Get information about the compute device.
         
-        Parameters
-        ----------
-        matrix : np.ndarray, shape (n, n)
-            Positive definite matrix to decompose
-        upper : bool, default=True
-            If True, return upper triangular factor U where A = U.T @ U
-            If False, return lower triangular factor L where A = L @ L.T
-            
         Returns
         -------
-        np.ndarray, shape (n, n)
-            Cholesky factor as NumPy array
-            
-        Notes
-        -----
-        Critical for inverse Cholesky parameterization: Σ = (Δ⁻¹)ᵀ Δ⁻¹
-        Must handle near-singular matrices gracefully.
+        dict
+            Device information including name, memory, capabilities
         """
-        pass
+        raise NotImplementedError
     
     @abstractmethod
-    def solve_triangular(self, a: np.ndarray, b: np.ndarray, 
-                        lower: bool = False) -> np.ndarray:
+    def to_device(self, array: np.ndarray) -> Any:
         """
-        Solve triangular linear system ax = b.
-        
-        Parameters
-        ----------
-        a : np.ndarray, shape (n, n)
-            Triangular matrix (upper or lower)
-        b : np.ndarray, shape (n,) or (n, k)
-            Right-hand side vector(s)
-        lower : bool, default=False
-            True if 'a' is lower triangular, False if upper triangular
-            
-        Returns
-        -------
-        np.ndarray, shape (n,) or (n, k)
-            Solution to the triangular system
-            
-        Notes
-        -----
-        Used extensively in likelihood computation for pattern-specific calculations.
-        """
-        pass
-    
-    @abstractmethod
-    def slogdet(self, matrix: np.ndarray) -> Tuple[float, float]:
-        """
-        Compute sign and log-determinant of matrix.
-        
-        Parameters
-        ----------
-        matrix : np.ndarray, shape (n, n)
-            Square matrix
-            
-        Returns
-        -------
-        sign : float
-            Sign of the determinant (-1, 0, or 1)
-        logdet : float
-            Natural logarithm of absolute determinant
-            
-        Notes
-        -----
-        Essential for log-likelihood computation.
-        For positive definite matrices, sign should always be +1.
-        """
-        pass
-    
-    @abstractmethod
-    def compute_gradient(self, objective_func: Callable, theta: np.ndarray, 
-                        **kwargs) -> np.ndarray:
-        """
-        Compute gradient of objective function at given parameter vector.
-        
-        Parameters
-        ----------
-        objective_func : callable
-            Function that takes parameter vector and returns scalar objective value
-        theta : np.ndarray, shape (n_params,)
-            Parameter vector at which to evaluate gradient
-        **kwargs : dict
-            Backend-specific arguments
-            
-        Returns
-        -------
-        np.ndarray, shape (n_params,)
-            Gradient vector
-            
-        Notes
-        -----
-        Implementation varies by backend:
-        - CPU backends: Use finite differences 
-        - GPU backends: Use autodiff for analytical gradients
-        
-        This is the key method that enables the two-track system.
-        """
-        pass
-
-
-class GPUBackendBase(BackendInterface):
-    """
-    Abstract base class for GPU backends.
-    
-    Provides the contract for GPU-specific functionality while maintaining
-    the core BackendInterface. GPU backends inherit common behavior patterns
-    through this base class.
-    
-    Key Responsibilities:
-    1. Define GPU-specific abstract methods
-    2. Establish inheritance hierarchy for code reuse
-    3. Declare autodiff gradient computation capability
-    
-    Inheritance Hierarchy:
-    BackendInterface (pure interface)
-    └── GPUBackendBase (GPU-specific interface)
-        ├── PyTorchBackend (CUDA, Metal, Intel GPU)
-        ├── JAXBackend (XLA compilation, TPU support)
-        └── [Future GPU backends]
-    """
-    
-    def gradient_method(self) -> str:
-        """GPU backends use analytical gradients."""
-        return 'autodiff'
-    
-    @abstractmethod
-    def _create_tensor(self, array: np.ndarray, requires_grad: bool = False):
-        """
-        Create tensor appropriate for this backend.
+        Transfer array to backend's compute device.
         
         Parameters
         ----------
         array : np.ndarray
-            NumPy array to convert to tensor
-        requires_grad : bool, default=False
-            Whether tensor should track gradients for autodiff
+            NumPy array to transfer
             
         Returns
         -------
-        tensor
-            Backend-specific tensor type
+        device_array
+            Array on target device (format depends on backend)
         """
-        pass
+        raise NotImplementedError
     
     @abstractmethod
-    def _tensor_to_numpy(self, tensor) -> np.ndarray:
+    def to_numpy(self, device_array: Any) -> np.ndarray:
         """
-        Convert tensor back to NumPy array.
+        Transfer array from device back to NumPy.
         
         Parameters
         ----------
-        tensor
-            Backend-specific tensor
+        device_array
+            Array on device
             
         Returns
         -------
         np.ndarray
             NumPy array on CPU
         """
-        pass
+        raise NotImplementedError
+    
+    @abstractmethod
+    def cholesky(self, matrix: Any, upper: bool) -> Any:
+        """
+        Compute Cholesky decomposition.
+        
+        Parameters
+        ----------
+        matrix
+            Positive definite matrix (on device)
+        upper : bool
+            If True, compute upper triangular. If False, lower.
+            
+        Returns
+        -------
+        cholesky_factor
+            Triangular Cholesky factor (on device)
+            
+        Raises
+        ------
+        LinAlgError
+            If matrix is not positive definite
+        """
+        raise NotImplementedError
+    
+    @abstractmethod
+    def solve_triangular(self, a: Any, b: Any, upper: bool, trans: str) -> Any:
+        """
+        Solve triangular system a @ x = b or a.T @ x = b.
+        
+        Parameters
+        ----------
+        a
+            Triangular matrix (on device)
+        b
+            Right-hand side (on device)
+        upper : bool
+            Whether a is upper triangular
+        trans : str
+            'N' for a @ x = b, 'T' for a.T @ x = b
+            
+        Returns
+        -------
+        x
+            Solution (on device)
+        """
+        raise NotImplementedError
+    
+    @abstractmethod
+    def matmul(self, a: Any, b: Any) -> Any:
+        """
+        Matrix multiplication.
+        
+        Parameters
+        ----------
+        a, b
+            Matrices to multiply (on device)
+            
+        Returns
+        -------
+        product
+            Matrix product a @ b (on device)
+        """
+        raise NotImplementedError
+    
+    @abstractmethod
+    def inv(self, matrix: Any) -> Any:
+        """
+        Matrix inversion.
+        
+        Parameters
+        ----------
+        matrix
+            Square matrix to invert (on device)
+            
+        Returns
+        -------
+        inverse
+            Matrix inverse (on device)
+            
+        Raises
+        ------
+        LinAlgError
+            If matrix is singular
+        """
+        raise NotImplementedError
+    
+    @abstractmethod
+    def log_det(self, matrix: Any) -> float:
+        """
+        Compute log determinant of positive definite matrix.
+        
+        Parameters
+        ----------
+        matrix
+            Positive definite matrix (on device)
+            
+        Returns
+        -------
+        float
+            Natural logarithm of determinant
+            
+        Notes
+        -----
+        Should use Cholesky decomposition for numerical stability:
+        log_det(A) = 2 * sum(log(diag(cholesky(A))))
+        """
+        raise NotImplementedError
+    
+    @abstractmethod
+    def quadratic_form(self, x: Any, A: Any) -> float:
+        """
+        Compute quadratic form x.T @ A @ x.
+        
+        Parameters
+        ----------
+        x
+            Vector (on device)
+        A
+            Positive definite matrix (on device)
+            
+        Returns
+        -------
+        float
+            Scalar result of quadratic form
+        """
+        raise NotImplementedError
 
 
-# Custom exception classes for backend operations
-class BackendError(Exception):
-    """Base exception for backend-related errors."""
-    pass
+class CPUBackend(BackendBase):
+    """
+    Base class for CPU backends.
+    
+    Always uses FP64 for R compatibility.
+    """
+    
+    def __init__(self):
+        """Initialize CPU backend with FP64 precision."""
+        super().__init__(precision='fp64')
+        self.device_type = 'cpu'
+    
+    def is_available(self) -> bool:
+        """CPU is always available."""
+        return True
+    
+    def get_device_info(self) -> Dict[str, Any]:
+        """Get CPU information."""
+        import platform
+        import psutil
+        
+        return {
+            'device_type': 'cpu',
+            'processor': platform.processor(),
+            'cpu_count': psutil.cpu_count(logical=False),
+            'cpu_count_logical': psutil.cpu_count(logical=True),
+            'memory_total': psutil.virtual_memory().total,
+            'precision': self.precision
+        }
 
 
-class BackendNotAvailableError(BackendError):
-    """Raised when requested backend is not available on this system."""
-    pass
+class GPUBackendFP32(BackendBase):
+    """
+    Base class for FP32 GPU backends.
+    
+    Optimized for consumer GPUs (RTX, Apple Metal).
+    Uses BFGS optimization method.
+    """
+    
+    def __init__(self):
+        """Initialize GPU backend with FP32 precision."""
+        super().__init__(precision='fp32')
+        self.device_type = 'gpu'
+        self.optimization_method = 'BFGS'
+    
+    @abstractmethod
+    def get_memory_usage(self) -> Dict[str, int]:
+        """
+        Get current GPU memory usage.
+        
+        Returns
+        -------
+        dict
+            Memory usage statistics (allocated, cached, total)
+        """
+        raise NotImplementedError
+    
+    def supports_autodiff(self) -> bool:
+        """
+        Check if backend supports automatic differentiation.
+        
+        Returns
+        -------
+        bool
+            True for PyTorch/JAX backends
+        """
+        return False  # Override in implementations that support it
 
 
-class NumericalError(BackendError):
-    """Raised when numerical computation fails (e.g., non-positive definite matrix)."""
-    pass
+class GPUBackendFP64(BackendBase):
+    """
+    Base class for FP64 GPU backends.
+    
+    For data center GPUs (A100, H100) with full FP64 support.
+    Uses Newton-CG optimization method.
+    """
+    
+    def __init__(self):
+        """Initialize GPU backend with FP64 precision."""
+        super().__init__(precision='fp64')
+        self.device_type = 'gpu'
+        self.optimization_method = 'Newton-CG'
+    
+    @abstractmethod
+    def get_memory_usage(self) -> Dict[str, int]:
+        """
+        Get current GPU memory usage.
+        
+        Returns
+        -------
+        dict
+            Memory usage statistics (allocated, cached, total)
+        """
+        raise NotImplementedError
+    
+    @abstractmethod
+    def check_fp64_performance(self) -> float:
+        """
+        Benchmark FP64 performance ratio.
+        
+        Returns
+        -------
+        float
+            Ratio of FP64 to FP32 throughput
+            
+        Notes
+        -----
+        Should run a small benchmark to verify FP64 is not gimped.
+        Expected: ~0.5 for full FP64, ~0.015 for gimped.
+        """
+        raise NotImplementedError
+    
+    def supports_autodiff(self) -> bool:
+        """
+        Check if backend supports automatic differentiation.
+        
+        Returns
+        -------
+        bool
+            True for PyTorch/JAX backends
+        """
+        return False  # Override in implementations that support it
 
 
-class GradientComputationError(BackendError):
-    """Raised when gradient computation fails (finite differences or autodiff)."""
-    pass
+class BackendFactory:
+    """
+    Factory for creating appropriate backend based on precision and hardware.
+    
+    This is the main entry point for backend selection.
+    """
+    
+    @staticmethod
+    def create_backend(use_fp64: bool, device_type: str) -> BackendBase:
+        """
+        Create appropriate backend based on precision and device.
+        
+        Parameters
+        ----------
+        use_fp64 : bool
+            Whether to use FP64 precision
+        device_type : str
+            'cpu', 'cuda', or 'metal'
+            
+        Returns
+        -------
+        BackendBase
+            Concrete backend implementation
+            
+        Raises
+        ------
+        ImportError
+            If required backend library not available
+        RuntimeError
+            If requested configuration not supported
+        """
+        if device_type == 'cpu':
+            from .cpu_fp64_backend import NumpyBackendFP64
+            return NumpyBackendFP64()
+        
+        elif device_type == 'cuda':
+            if use_fp64:
+                from .gpu_fp64_backend import PyTorchBackendFP64
+                return PyTorchBackendFP64()
+            else:
+                from .gpu_fp32_backend import PyTorchBackendFP32
+                return PyTorchBackendFP32()
+        
+        elif device_type == 'metal':
+            if use_fp64:
+                raise RuntimeError(
+                    "FP64 not supported on Apple Metal. "
+                    "Please use FP32 (use_fp64=False) or CPU backend."
+                )
+            from .gpu_fp32_backend import PyTorchBackendFP32
+            return PyTorchBackendFP32()
+        
+        else:
+            raise ValueError(f"Unknown device type: {device_type}")
+    
+    @staticmethod
+    def get_optimal_backend(use_fp64: Optional[bool] = None) -> BackendBase:
+        """
+        Automatically select optimal backend based on hardware.
+        
+        Parameters
+        ----------
+        use_fp64 : bool or None
+            If None, auto-select based on hardware capabilities
+            
+        Returns
+        -------
+        BackendBase
+            Optimal backend for current hardware
+        """
+        from .precision_detector import detect_gpu_capabilities, recommend_precision
+        
+        # Detect hardware
+        caps = detect_gpu_capabilities()
+        
+        # Determine precision
+        if use_fp64 is None:
+            use_fp64 = recommend_precision(caps, None)
+        else:
+            # Validate user request
+            from .precision_detector import validate_fp64_request
+            validate_fp64_request(caps, use_fp64)
+        
+        # Select backend
+        if not caps.has_gpu:
+            device_type = 'cpu'
+        else:
+            device_type = caps.gpu_type
+        
+        return BackendFactory.create_backend(use_fp64, device_type)

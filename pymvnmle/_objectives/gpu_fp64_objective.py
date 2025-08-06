@@ -173,12 +173,8 @@ class GPUObjectiveFP64(MLEObjectiveBase):
             gpu_pattern['n_observed'] = len(pattern.observed_indices)
             self.gpu_patterns.append(gpu_pattern)
         
-        # Constants in FP64
-        self.log_2pi_gpu = torch.tensor(
-            np.log(2 * np.pi),
-            device=self.device,
-            dtype=self.dtype
-        )
+        # Note: We do NOT store log(2π) since CPU doesn't use it
+        # self.log_2pi_gpu = torch.tensor(...)  # REMOVED
     
     def get_initial_parameters(self) -> np.ndarray:
         """
@@ -254,12 +250,13 @@ class GPUObjectiveFP64(MLEObjectiveBase):
             sigma_k = sigma_gpu[obs_idx][:, obs_idx]
             
             # Compute pattern contribution (no regularization needed for FP64)
+            # CRITICAL: This returns the TOTAL contribution for all n_obs in the pattern
             contrib = self._compute_pattern_contribution_gpu(
                 gpu_pattern, mu_k, sigma_k
             )
             
-            # Weight by number of observations
-            obj_value = obj_value + gpu_pattern['n_obs'] * contrib
+            # Add contribution directly - do NOT multiply by n_obs!
+            obj_value = obj_value + contrib
         
         return obj_value.squeeze()
     
@@ -269,51 +266,49 @@ class GPUObjectiveFP64(MLEObjectiveBase):
         """
         Compute pattern contribution with FP64 precision.
         
-        Uses R-compatible formula: n_k * [const + log|Σ| + tr(Σ⁻¹S)]
-        where S is the sample covariance matrix.
+        CRITICAL: The CPU objective does NOT include the constant term n*p*log(2π)!
+        It only computes: n_k * [log|Σ_k| + tr(Σ_k^-1 * S_k)]
         
         Parameters
         ----------
         pattern : dict
             GPU pattern data
         mu_k : torch.Tensor
-            Mean for observed variables (FP64)
+            Mean for observed variables
         sigma_k : torch.Tensor
-            Covariance for observed variables (FP64)
+            Covariance for observed variables
             
         Returns
         -------
         torch.Tensor
-            Pattern contribution to objective (total, not per observation)
+            Pattern contribution to -2*log-likelihood (WITHOUT constant term)
         """
         torch = self.torch
         
         n_obs = pattern['n_obs']
         n_obs_vars = pattern['n_observed']
         
-        # Constant term for all observations in this pattern
-        const_term = n_obs * n_obs_vars * self.log_2pi_gpu
+        # NO CONSTANT TERM! The CPU doesn't include n*p*log(2π)
+        # This is the key fix that makes GPU match CPU
         
-        # Log determinant term for all observations
+        # Log determinant term: log|Σ_k|
         L_k = torch.linalg.cholesky(sigma_k)
-        log_det = 2.0 * torch.sum(torch.log(torch.diag(L_k)))
-        log_det_term = n_obs * log_det
+        log_det_term = 2.0 * torch.sum(torch.log(torch.diag(L_k)))
         
-        # Compute sample covariance matrix (R-style)
-        data_centered = pattern['data'] - mu_k  # shape: (n_obs, n_observed)
+        # Compute sample covariance matrix
+        # S_k = (1/n) * Σᵢ (xᵢ - μ)(xᵢ - μ)ᵀ
+        data_centered = pattern['data'] - mu_k
         S_k = (data_centered.T @ data_centered) / n_obs
         
         # Trace term: tr(Σ_k^-1 * S_k)
-        # Use Cholesky solve for numerical stability
-        Y = torch.linalg.solve_triangular(L_k, S_k, upper=False)
-        Z = torch.linalg.solve_triangular(L_k.T, Y, upper=True)
-        trace_term = torch.trace(Z)
-        trace_term = n_obs * trace_term
+        X = torch.linalg.solve(sigma_k, S_k)
+        trace_term = torch.trace(X)
         
-        # Total contribution (not averaged)
-        total_contribution = const_term + log_det_term + trace_term
+        # Total contribution: n_obs * [log|Σ| + tr(Σ^-1 S)]
+        # NO CONSTANT TERM to match CPU!
+        total_contribution = n_obs * (log_det_term + trace_term)
         
-        return total_contribution / n_obs  # Return per-observation average for consistency
+        return total_contribution
     
     def _unpack_gpu(self, theta_gpu: Any) -> Tuple[Any, Any]:
         """
@@ -322,14 +317,14 @@ class GPUObjectiveFP64(MLEObjectiveBase):
         Parameters
         ----------
         theta_gpu : torch.Tensor
-            Parameter vector on GPU (FP64)
+            Parameter vector on GPU
             
         Returns
         -------
         mu : torch.Tensor
-            Mean vector on GPU (FP64)
+            Mean vector on GPU
         sigma : torch.Tensor
-            Covariance matrix on GPU (FP64)
+            Covariance matrix on GPU
         """
         torch = self.torch
         n = self.n_vars
@@ -353,7 +348,7 @@ class GPUObjectiveFP64(MLEObjectiveBase):
         # Compute Σ = LL'
         sigma = L @ L.T
         
-        # Ensure exact symmetry (important even for FP64)
+        # Ensure symmetry
         sigma = 0.5 * (sigma + sigma.T)
         
         return mu, sigma
@@ -382,7 +377,7 @@ class GPUObjectiveFP64(MLEObjectiveBase):
             requires_grad=True
         )
         
-        # Compute objective (never use compiled version for gradients)
+        # Compute objective
         obj_value = self._torch_objective(theta_gpu)
         
         # Compute gradient via autodiff
@@ -395,8 +390,6 @@ class GPUObjectiveFP64(MLEObjectiveBase):
         """
         Compute Hessian matrix using automatic differentiation.
         
-        Enables Newton-CG optimization for FP64.
-        
         Parameters
         ----------
         theta : np.ndarray
@@ -405,7 +398,7 @@ class GPUObjectiveFP64(MLEObjectiveBase):
         Returns
         -------
         np.ndarray
-            Hessian matrix of shape (n_params, n_params)
+            Hessian matrix
         """
         torch = self.torch
         
@@ -417,73 +410,73 @@ class GPUObjectiveFP64(MLEObjectiveBase):
             requires_grad=True
         )
         
-        # Compute gradient with create_graph=True for second derivatives
-        if self.use_compiled:
-            obj_value = self._compiled_objective(theta_gpu)
-        else:
-            obj_value = self._torch_objective(theta_gpu)
-        
-        # First derivatives
+        # Compute gradient with grad graph retained
+        obj_value = self._torch_objective(theta_gpu)
         grad = torch.autograd.grad(
-            obj_value, theta_gpu, 
-            create_graph=True, retain_graph=True
+            obj_value, theta_gpu, create_graph=True
         )[0]
         
         # Compute Hessian row by row
-        hessian = []
-        for i in range(self.n_params):
-            # Second derivative with respect to theta[i]
-            grad2 = torch.autograd.grad(
-                grad[i], theta_gpu,
-                retain_graph=True
-            )[0]
-            hessian.append(grad2.cpu().numpy())
+        n = len(theta)
+        hessian = torch.zeros((n, n), device=self.device, dtype=self.dtype)
         
-        return np.array(hessian)
+        for i in range(n):
+            # Second derivatives
+            grad2 = torch.autograd.grad(
+                grad[i], theta_gpu, retain_graph=True
+            )[0]
+            hessian[i] = grad2
+        
+        # Ensure symmetry
+        hessian = 0.5 * (hessian + hessian.T)
+        
+        return hessian.cpu().numpy()
     
     def compute_newton_direction(self, theta: np.ndarray,
-                                grad: Optional[np.ndarray] = None) -> np.ndarray:
+                                grad: Optional[np.ndarray] = None,
+                                hess: Optional[np.ndarray] = None) -> np.ndarray:
         """
-        Compute Newton direction for Newton-CG.
-        
-        Solves: H d = -g where H is Hessian, g is gradient
+        Compute Newton direction for Newton-CG optimization.
         
         Parameters
         ----------
         theta : np.ndarray
-            Current parameter vector
+            Current parameters
         grad : np.ndarray or None
-            Current gradient (computed if None)
+            Current gradient
+        hess : np.ndarray or None
+            Current Hessian
             
         Returns
         -------
         np.ndarray
-            Newton direction vector
+            Newton direction
         """
         if grad is None:
             grad = self.compute_gradient(theta)
+        if hess is None:
+            hess = self.compute_hessian(theta)
         
-        hessian = self.compute_hessian(theta)
+        # Regularize Hessian if needed
+        eigenvals = np.linalg.eigvalsh(hess)
+        if eigenvals.min() < 1e-8:
+            hess = hess + (1e-8 - eigenvals.min()) * np.eye(len(theta))
         
-        # Solve H d = -g using Cholesky decomposition
+        # Solve Hessian * direction = -gradient
         try:
-            # Add small regularization for numerical stability
-            hessian_reg = hessian + self.eps * np.eye(self.n_params)
-            L = np.linalg.cholesky(hessian_reg)
-            y = np.linalg.solve(L, -grad)
-            direction = np.linalg.solve(L.T, y)
+            direction = -np.linalg.solve(hess, grad)
         except np.linalg.LinAlgError:
-            # Fall back to pseudoinverse if Hessian is singular
-            warnings.warn("Hessian is singular, using pseudoinverse")
-            direction = -np.linalg.pinv(hessian) @ grad
+            # Fall back to gradient descent
+            direction = -grad
         
         return direction
     
-    def line_search(self, theta: np.ndarray, direction: np.ndarray,
+    def line_search(self, theta: np.ndarray,
+                   direction: np.ndarray,
                    grad: Optional[np.ndarray] = None,
                    alpha_init: float = 1.0) -> float:
         """
-        Backtracking line search for Newton-CG.
+        Perform line search along Newton direction.
         
         Parameters
         ----------

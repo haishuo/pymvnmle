@@ -216,12 +216,14 @@ class GPUObjectiveFP32(MLEObjectiveBase):
             )
             
             # Compute pattern contribution
+            # CRITICAL: This returns the TOTAL contribution for all n_obs in the pattern
+            # Do NOT multiply by n_obs again!
             contrib = self._compute_pattern_contribution_gpu(
                 gpu_pattern, mu_k, sigma_k
             )
             
-            # Weight by number of observations
-            obj_value = obj_value + gpu_pattern['n_obs'] * contrib
+            # Add contribution directly
+            obj_value = obj_value + contrib
         
         return obj_value.squeeze()
     
@@ -231,8 +233,8 @@ class GPUObjectiveFP32(MLEObjectiveBase):
         """
         Compute pattern contribution on GPU.
         
-        Uses R-compatible formula: n_k * [const + log|Σ| + tr(Σ⁻¹S)]
-        where S is the sample covariance matrix.
+        CRITICAL: The CPU objective does NOT include the constant term n*p*log(2π)!
+        It only computes: n_k * [log|Σ_k| + tr(Σ_k^-1 * S_k)]
         
         Parameters
         ----------
@@ -246,29 +248,28 @@ class GPUObjectiveFP32(MLEObjectiveBase):
         Returns
         -------
         torch.Tensor
-            Pattern contribution to objective (total, not per observation)
+            Pattern contribution to -2*log-likelihood (WITHOUT constant term)
         """
         torch = self.torch
         
         n_obs = pattern['n_obs']
         n_obs_vars = pattern['n_observed']
+
+        # NO CONSTANT TERM! The CPU doesn't include n*p*log(2π)
+        # const_term = n_obs_vars * self.log_2pi_gpu  # REMOVED!
         
-        # Constant term for all observations in this pattern
-        const_term = n_obs * n_obs_vars * self.log_2pi_gpu
-        
-        # Log determinant term for all observations
+        # Log determinant term: log|Σ_k|
         try:
             L_k = torch.linalg.cholesky(sigma_k)
-            log_det = 2.0 * torch.sum(torch.log(torch.diag(L_k)))
+            log_det_term = 2.0 * torch.sum(torch.log(torch.diag(L_k)))
         except:
             # Fallback for near-singular matrices
             eigenvals = torch.linalg.eigvalsh(sigma_k)
             eigenvals = torch.clamp(eigenvals, min=self.eps)
-            log_det = torch.sum(torch.log(eigenvals))
+            log_det_term = torch.sum(torch.log(eigenvals))
         
-        log_det_term = n_obs * log_det
-        
-        # Compute sample covariance matrix (R-style)
+        # Compute sample covariance matrix
+        # S_k = (1/n) * Σᵢ (xᵢ - μ)(xᵢ - μ)ᵀ
         data_centered = pattern['data'] - mu_k  # shape: (n_obs, n_observed)
         S_k = (data_centered.T @ data_centered) / n_obs
         
@@ -284,12 +285,11 @@ class GPUObjectiveFP32(MLEObjectiveBase):
             Z = torch.linalg.solve_triangular(L_k.T, Y, upper=True)
             trace_term = torch.trace(Z)
         
-        trace_term = n_obs * trace_term
-        
-        # Total contribution (not averaged)
-        total_contribution = const_term + log_det_term + trace_term
-        
-        return total_contribution / n_obs  # Return per-observation average for consistency
+        # Total contribution: n_obs * [log|Σ| + tr(Σ^-1 S)]
+        # NO CONSTANT TERM to match CPU!
+        total_contribution = n_obs * (log_det_term + trace_term)
+
+        return total_contribution
     
     def _unpack_gpu(self, theta_gpu: Any) -> Tuple[Any, Any]:
         """

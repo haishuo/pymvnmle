@@ -202,7 +202,15 @@ class CPUObjectiveFP64(MLEObjectiveBase):
             try:
                 # Use R's exact computation approach
                 # Log-determinant of Delta_k (more stable than computing Sigma_k first)
-                log_det_delta_k = np.sum(np.log(np.diag(Delta_k)))
+                diag_delta_k = np.diag(Delta_k)
+                
+                # Check for numerical issues
+                if np.any(diag_delta_k <= 0):
+                    # This shouldn't happen with proper Givens rotations
+                    # Return large penalty value
+                    return 1e20
+                
+                log_det_delta_k = np.sum(np.log(diag_delta_k))
                 
                 # Compute quadratic form efficiently
                 # For each observation, compute (y - μ)'Σ^{-1}(y - μ)

@@ -32,7 +32,7 @@ def mlest(
     backend: str = 'auto',
     gpu64: bool = False,
     method: str = 'auto',
-    tol: float = 1e-7,
+    tol: float = 1e-6,
     max_iter: int = 100,
     verbose: bool = False
 ) -> MLResult:
@@ -183,6 +183,7 @@ def mlest(
         has_hessian=has_hessian,
         user_preference=method if method != 'auto' else None,
         max_iter=max_iter,
+        tol=tol,
         verbose=verbose
     )
     

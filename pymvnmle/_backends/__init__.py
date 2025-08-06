@@ -1,147 +1,65 @@
 """
-Backend registry for PyMVNMLE v2.0
-Simple backend registration and selection - no bloat
+Backend module initialization.
 
-DESIGN PRINCIPLE: Minimal functionality to get core system working
-- Register available backends
-- Simple selection logic
-- Basic error handling
-- Nothing else
-
-Advanced features (diagnostics, benchmarking, complex selection) come later.
+Provides a unified interface for backend selection and management.
 """
 
-from typing import List, Optional, Tuple
-from .base import BackendInterface, GPUBackendBase, BackendNotAvailableError
+from typing import Optional, Union
+import warnings
+import numpy as np
 
 
-# Global registry of available backend classes
-_BACKEND_CLASSES = {}
+# Import base classes
+from .base import (
+    BackendBase,
+    CPUBackend,
+    GPUBackendFP32,
+    GPUBackendFP64,
+    BackendFactory
+)
 
-# Global cache of initialized backends
-_BACKEND_INSTANCES = {}
+# Import concrete implementations
+from .cpu_fp64_backend import NumpyBackendFP64
 
-
-def _register_numpy_backend():
-    """Register the always-available NumPy backend."""
-    try:
-        from .numpy_backend import NumPyBackend
-        _BACKEND_CLASSES['numpy'] = NumPyBackend
-    except ImportError:
-        # This should never happen since NumPy is a hard dependency
-        raise RuntimeError("Critical error: NumPy backend unavailable")
-
-
-def _register_optional_backends():
-    """Register optional backends that may not be available."""
-    # PyTorch backend (revolutionary autodiff)
-    try:
-        from .pytorch_backend import PyTorchBackend
-        _BACKEND_CLASSES['pytorch'] = PyTorchBackend
-    except ImportError:
-        pass  # PyTorch not available
-    
-    # JAX backend (for completeness)
-    try:
-        from .jax_backend import JAXBackend
-        _BACKEND_CLASSES['jax'] = JAXBackend
-    except ImportError:
-        pass  # JAX not available
+# Try to import GPU backends (optional)
+try:
+    from .gpu_fp32_backend import PyTorchBackendFP32
+    from .gpu_fp64_backend import PyTorchBackendFP64
+    PYTORCH_AVAILABLE = True
+except ImportError:
+    PYTORCH_AVAILABLE = False
+    PyTorchBackendFP32 = None
+    PyTorchBackendFP64 = None
 
 
-def get_available_backends() -> List[str]:
+# Maintain backward compatibility with old names
+BackendInterface = BackendBase  # Alias for compatibility
+GPUBackendBase = GPUBackendFP32  # Alias for compatibility
+
+
+class BackendNotAvailableError(ImportError):
+    """Raised when a requested backend is not available."""
+    pass
+
+
+def get_backend(backend: str = 'auto', 
+                use_fp64: Optional[bool] = None,
+                **kwargs) -> BackendBase:
     """
-    Get list of backends available on this system.
-    
-    Returns
-    -------
-    List[str]
-        Names of available backends, with 'numpy' always first
-    """
-    # Ensure backends are registered
-    _register_numpy_backend()
-    _register_optional_backends()
-    
-    available = []
-    
-    # Test each backend for actual availability
-    for name, backend_class in _BACKEND_CLASSES.items():
-        try:
-            backend = backend_class()
-            if backend.is_available:
-                available.append(name)
-        except Exception:
-            # Backend failed initialization - skip it
-            continue
-    
-    # Ensure numpy is always first (most reliable)
-    if 'numpy' in available:
-        available.remove('numpy')
-        available.insert(0, 'numpy')
-    
-    return available
-
-
-def select_backend(backend_name: str, data_shape: Optional[Tuple[int, int]] = None) -> str:
-    """
-    Simple backend selection logic.
+    Get computational backend.
     
     Parameters
     ----------
-    backend_name : str
-        Requested backend name or 'auto'
-    data_shape : tuple of int, optional
-        Shape of data matrix for auto-selection
+    backend : str
+        Backend name: 'auto', 'cpu', 'gpu', 'numpy', 'pytorch', 'cuda', 'metal'
+    use_fp64 : bool or None
+        If None, auto-select based on hardware
+    **kwargs
+        Additional backend-specific options
         
     Returns
     -------
-    str
-        Name of selected backend
-        
-    Notes
-    -----
-    Auto-selection logic is conservative:
-    - Small problems: Always use 'numpy' (reliable)
-    - Large problems: Use GPU if available, otherwise 'numpy'
-    - Always default to 'numpy' for safety
-    """
-    if backend_name != 'auto':
-        return backend_name
-    
-    # Auto-selection: conservative approach
-    available = get_available_backends()
-    
-    if data_shape is None:
-        return available[0]  # Default to first available (should be 'numpy')
-    
-    n_obs, n_vars = data_shape
-    
-    # Small problems: CPU is optimal (avoid GPU overhead)
-    if n_vars <= 20 or n_obs <= 500:
-        return 'numpy'
-    
-    # Large problems: Use GPU if available
-    if 'pytorch' in available:
-        return 'pytorch'
-    elif 'jax' in available:
-        return 'jax'
-    
-    # Fallback to CPU
-    return 'numpy'
-
-
-def get_backend(backend_name: str) -> BackendInterface:
-    """
-    Get a backend instance by name.
-    
-    Parameters
-    ----------
-    backend_name : str
-        Name of backend to retrieve
-        
-    Returns
-    -------
-    BackendInterface
+    BackendBase
         Initialized backend instance
         
     Raises
@@ -149,107 +67,277 @@ def get_backend(backend_name: str) -> BackendInterface:
     BackendNotAvailableError
         If requested backend is not available
     """
-    # Handle aliases
-    aliases = {
-        'cpu': 'numpy',
-        'gpu': 'pytorch',
-    }
-    actual_name = aliases.get(backend_name, backend_name)
+    backend = backend.lower()
     
-    # Check if backend is already cached
-    if actual_name in _BACKEND_INSTANCES:
-        return _BACKEND_INSTANCES[actual_name]
+    # Handle backend aliases
+    if backend in ['numpy', 'cpu']:
+        return NumpyBackendFP64()
     
-    # Ensure backends are registered
-    _register_numpy_backend()
-    _register_optional_backends()
+    elif backend == 'auto':
+        return BackendFactory.get_optimal_backend(use_fp64)
     
-    # Check if backend class is available
-    if actual_name not in _BACKEND_CLASSES:
-        available = get_available_backends()
-        raise BackendNotAvailableError(
-            f"Backend '{actual_name}' is not available. "
-            f"Available backends: {available}"
+    elif backend in ['gpu', 'pytorch', 'cuda', 'metal']:
+        if not PYTORCH_AVAILABLE:
+            raise BackendNotAvailableError(
+                "GPU backend requires PyTorch. "
+                "Install with: pip install torch"
+            )
+        
+        # Determine device type
+        from .precision_detector import detect_gpu_capabilities
+        caps = detect_gpu_capabilities()
+        
+        if not caps.has_gpu:
+            warnings.warn(
+                "No GPU detected, falling back to CPU backend. "
+                "This will be slower than using the native CPU backend."
+            )
+            device_type = 'cpu'
+        else:
+            device_type = caps.gpu_type
+        
+        # Create backend
+        return BackendFactory.create_backend(
+            use_fp64=use_fp64 if use_fp64 is not None else caps.recommended_fp64,
+            device_type=device_type
         )
     
-    # Instantiate and validate backend
-    try:
-        backend_class = _BACKEND_CLASSES[actual_name]
-        backend = backend_class()
-        
-        if not backend.is_available:
-            raise BackendNotAvailableError(
-                f"Backend '{actual_name}' failed availability check"
-            )
-        
-        # Cache the instance
-        _BACKEND_INSTANCES[actual_name] = backend
-        return backend
-        
-    except Exception as e:
-        if isinstance(e, BackendNotAvailableError):
-            raise
-        else:
-            raise BackendNotAvailableError(
-                f"Failed to initialize backend '{actual_name}': {e}"
-            )
+    else:
+        raise ValueError(
+            f"Unknown backend: {backend}. "
+            f"Available: 'auto', 'cpu', 'gpu', 'numpy', 'pytorch'"
+        )
 
 
-def get_backend_with_fallback(backend_name: str, 
-                             data_shape: Optional[Tuple[int, int]] = None,
-                             **kwargs) -> BackendInterface:
+def get_backend_with_fallback(backend: str = 'auto',
+                              use_fp64: Optional[bool] = None,
+                              fallback: str = 'cpu',
+                              **kwargs) -> BackendBase:
     """
-    Get backend with automatic fallback to CPU if requested backend fails.
+    Get backend with automatic fallback.
     
     Parameters
     ----------
-    backend_name : str
-        Requested backend name ('auto', 'numpy', 'pytorch', 'jax')
-    data_shape : tuple of int, optional
-        Shape of data matrix for auto-selection
+    backend : str
+        Primary backend choice
+    use_fp64 : bool or None
+        Precision preference
+    fallback : str
+        Fallback backend if primary fails
     **kwargs
-        Additional arguments (ignored for now - extensibility)
+        Backend-specific options
         
     Returns
     -------
-    BackendInterface
-        Functional backend instance
-        
-    Raises
-    ------
-    BackendNotAvailableError
-        If no functional backends are available (critical system error)
+    BackendBase
+        Initialized backend (primary or fallback)
     """
-    # Handle auto-selection
-    if backend_name == 'auto':
-        backend_name = select_backend('auto', data_shape)
-    
-    # Try to get the requested backend
     try:
-        return get_backend(backend_name)
+        return get_backend(backend, use_fp64, **kwargs)
+    except (BackendNotAvailableError, RuntimeError, ImportError) as e:
+        warnings.warn(
+            f"Backend '{backend}' not available: {e}. "
+            f"Falling back to '{fallback}' backend."
+        )
+        return get_backend(fallback, use_fp64, **kwargs)
+
+
+def get_available_backends() -> dict:
+    """
+    Get all available backends and their capabilities.
+    
+    Returns
+    -------
+    dict
+        Backend information including availability and capabilities
+    """
+    backends = {
+        'numpy': {
+            'available': True,
+            'backend_class': 'NumpyBackendFP64',
+            'precision': 'fp64',
+            'autodiff': False,
+            'description': 'NumPy CPU backend (always available)'
+        },
+        'cpu': {
+            'available': True,
+            'backend_class': 'NumpyBackendFP64',
+            'precision': 'fp64',
+            'autodiff': False,
+            'description': 'NumPy CPU backend (always available)'
+        }
+    }
+    
+    if PYTORCH_AVAILABLE:
+        import torch
         
-    except BackendNotAvailableError:
-        # If requested backend failed and it's not numpy, try numpy fallback
-        if backend_name != 'numpy':
-            try:
-                return get_backend('numpy')
-            except BackendNotAvailableError:
-                # Even numpy failed - critical system error
-                raise BackendNotAvailableError(
-                    f"All backends failed. Requested '{backend_name}' failed, "
-                    f"and NumPy fallback also failed. Check your environment."
-                )
-        else:
-            # NumPy itself failed - re-raise original error
-            raise
+        has_cuda = torch.cuda.is_available()
+        has_mps = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+        
+        backends['pytorch'] = {
+            'available': True,
+            'backend_class': 'PyTorchBackend',
+            'precision': 'fp32/fp64',
+            'autodiff': True,
+            'description': 'PyTorch backend'
+        }
+        
+        if has_cuda:
+            backends['cuda'] = {
+                'available': True,
+                'backend_class': 'PyTorchBackendFP32/FP64',
+                'precision': 'fp32/fp64',
+                'autodiff': True,
+                'device_name': torch.cuda.get_device_name(0),
+                'description': 'PyTorch CUDA backend'
+            }
+        
+        if has_mps:
+            backends['metal'] = {
+                'available': True,
+                'backend_class': 'PyTorchBackendFP32',
+                'precision': 'fp32',
+                'autodiff': True,
+                'description': 'PyTorch Metal Performance Shaders backend'
+            }
+    
+    return backends
 
 
-# Export the essential functions only
+# Alias for compatibility
+list_available_backends = get_available_backends
+
+
+def list_available_backends() -> dict:
+    """
+    List all available backends and their capabilities.
+    
+    Returns
+    -------
+    dict
+        Backend information including availability and capabilities
+    """
+    backends = {
+        'cpu': {
+            'available': True,
+            'backend_class': 'NumpyBackendFP64',
+            'precision': 'fp64',
+            'autodiff': False,
+            'description': 'NumPy CPU backend (always available)'
+        }
+    }
+    
+    if PYTORCH_AVAILABLE:
+        import torch
+        
+        has_cuda = torch.cuda.is_available()
+        has_mps = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+        
+        if has_cuda:
+            backends['cuda'] = {
+                'available': True,
+                'backend_class': 'PyTorchBackendFP32/FP64',
+                'precision': 'fp32/fp64',
+                'autodiff': True,
+                'device_name': torch.cuda.get_device_name(0),
+                'description': 'PyTorch CUDA backend'
+            }
+        
+        if has_mps:
+            backends['metal'] = {
+                'available': True,
+                'backend_class': 'PyTorchBackendFP32',
+                'precision': 'fp32',
+                'autodiff': True,
+                'description': 'PyTorch Metal Performance Shaders backend'
+            }
+    
+    return backends
+
+
+def benchmark_backends(test_size: int = 100) -> dict:
+    """
+    Benchmark available backends.
+    
+    Parameters
+    ----------
+    test_size : int
+        Size of test matrices
+        
+    Returns
+    -------
+    dict
+        Benchmark results for each backend
+    """
+    import time
+    
+    results = {}
+    
+    # Test data
+    np.random.seed(42)
+    A = np.random.randn(test_size, test_size)
+    pos_def = A @ A.T + np.eye(test_size)
+    
+    # Benchmark each available backend
+    for backend_name in ['cpu', 'gpu']:
+        try:
+            backend = get_backend(backend_name)
+            
+            # Transfer to device
+            matrix = backend.to_device(pos_def)
+            
+            # Benchmark Cholesky
+            start = time.perf_counter()
+            for _ in range(10):
+                L = backend.cholesky(matrix, upper=False)
+            elapsed = time.perf_counter() - start
+            
+            results[backend_name] = {
+                'available': True,
+                'cholesky_time': elapsed / 10,
+                'backend_info': backend.get_device_info() if hasattr(backend, 'get_device_info') else {}
+            }
+            
+        except Exception as e:
+            results[backend_name] = {
+                'available': False,
+                'error': str(e)
+            }
+    
+    return results
+
+
+# Convenience function for testing
+def get_test_backend() -> BackendBase:
+    """Get a backend suitable for testing (CPU preferred for determinism)."""
+    return NumpyBackendFP64()
+
+
 __all__ = [
-    'BackendInterface',
-    'GPUBackendBase',  # <-- ADD THIS LINE
+    # Base classes
+    'BackendBase',
+    'CPUBackend', 
+    'GPUBackendFP32',
+    'GPUBackendFP64',
+    'BackendFactory',
+    
+    # Concrete implementations
+    'NumpyBackendFP64',
+    'PyTorchBackendFP32',
+    'PyTorchBackendFP64',
+    
+    # Functions
+    'get_backend',
+    'get_backend_with_fallback',
+    'get_available_backends',  # Added this
+    'list_available_backends',
+    'benchmark_backends',
+    'get_test_backend',
+    
+    # Exceptions
     'BackendNotAvailableError',
-    'get_available_backends',
-    'select_backend',
-    'get_backend'
+    
+    # Compatibility aliases
+    'BackendInterface',
+    'GPUBackendBase'
 ]

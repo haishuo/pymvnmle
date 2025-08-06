@@ -13,22 +13,19 @@ import numpy as np
 import warnings
 import time
 from typing import Optional, Tuple, Union
+from pymvnmle._objectives import get_objective
 
 # Import precision detector
 from pymvnmle._backends.precision_detector import detect_gpu_capabilities
+
+# Import backend selector
+from pymvnmle._backends import get_backend
 
 # Import data structures
 from pymvnmle.data_structures import MLResult
 
 # Import pattern analysis
 from pymvnmle.patterns import analyze_patterns
-
-# Import scipy optimizer wrappers  
-from pymvnmle._scipy_optimizers import (
-    optimize_with_scipy,
-    validate_method,
-    auto_select_method
-)
 
 
 def _backend_method_selection(
@@ -57,18 +54,20 @@ def _backend_method_selection(
     Returns
     -------
     tuple
-        (selected_backend, selected_method)
+        (selected_backend, selected_method, backend_obj)
     """
     backend_lower = backend.lower()
     
-    # CRITICAL: Auto defaults to CPU for R compatibility
+    # CRITICAL FIX: Auto should default to CPU for R compatibility
     if backend_lower == 'auto':
         if verbose:
             print("Backend 'auto': defaulting to CPU for R compatibility")
         selected_backend = 'cpu'
+        backend_obj = None  # Not needed for scipy
         
     elif backend_lower in ['cpu', 'numpy', 'r']:
         selected_backend = 'cpu'
+        backend_obj = None
         
     elif backend_lower in ['gpu', 'cuda', 'metal', 'pytorch']:
         # Check if GPU is available
@@ -76,15 +75,19 @@ def _backend_method_selection(
             gpu_caps = detect_gpu_capabilities()
             if gpu_caps.has_gpu:
                 selected_backend = 'gpu_fp64' if gpu64 else 'gpu_fp32'
+                backend_obj = None
                 if verbose:
                     print(f"GPU backend selected: {selected_backend}")
                     print(f"Device: {gpu_caps.device_name}")
+                    print("Note: GPU uses different parameterization (standard Cholesky)")
             else:
                 warnings.warn("GPU requested but not available, using CPU")
                 selected_backend = 'cpu'
+                backend_obj = None
         except:
             warnings.warn("Could not detect GPU, using CPU")
             selected_backend = 'cpu'
+            backend_obj = None
     else:
         raise ValueError(f"Unknown backend: {backend}")
     
@@ -107,7 +110,14 @@ def _backend_method_selection(
         print(f"Selected backend: {selected_backend}")
         print(f"Selected method: {selected_method}")
     
-    return selected_backend, selected_method
+    return selected_backend, selected_method, backend_obj
+
+# Import scipy optimizer wrappers  
+from pymvnmle._scipy_optimizers import (
+    optimize_with_scipy,
+    validate_method,
+    auto_select_method
+)
 
 
 def mlest(
@@ -135,86 +145,75 @@ def mlest(
     gpu64 : bool
         Force FP64 precision on GPU. May be very slow on consumer GPUs
     method : {'auto', 'BFGS', 'Newton-CG', 'L-BFGS-B', 'Nelder-Mead', 'Powell'}
-        Optimization method. 'auto' selects based on backend
+        Optimization method. Uses scipy.optimize.minimize
     tol : float
         Convergence tolerance
     max_iter : int
-        Maximum number of iterations
+        Maximum iterations
     verbose : bool
-        Print progress information
+        Print optimization progress
         
     Returns
     -------
     MLResult
-        Result object containing estimates and diagnostics
+        Result object containing parameter estimates and diagnostics
+        
+    Raises
+    ------
+    ValueError
+        If input data is invalid or optimization configuration is incompatible
+    RuntimeError
+        If optimization fails
     """
-    # Start timing
     start_time = time.time()
     
-    # Validate input data
-    if not isinstance(data, np.ndarray):
-        data = np.asarray(data, dtype=np.float64)
-    
-    if data.ndim != 2:
-        raise ValueError(f"Data must be 2D array, got shape {data.shape}")
-    
+    # Step 1: Validate and prepare input data
+    data = _validate_input(data)
     n_obs, n_vars = data.shape
-    
-    if n_obs < 2:
-        raise ValueError(f"Need at least 2 observations, got {n_obs}")
-    
-    if n_vars < 1:
-        raise ValueError(f"Need at least 1 variable, got {n_vars}")
-    
-    # Check for missing data
-    n_missing = np.sum(np.isnan(data))
-    missing_rate = n_missing / data.size
-    
-    # Analyze patterns
-    patterns = analyze_patterns(data)
-    n_patterns = len(patterns['pattern_counts'])
-    n_complete = patterns['n_complete_cases']
     
     if verbose:
         print("=" * 60)
         print("Maximum Likelihood Estimation for MVN with Missing Data")
         print("-" * 60)
         print(f"Data shape: {n_obs} observations, {n_vars} variables")
-        print(f"Missing values: {n_missing} ({missing_rate*100:.1f}%)")
-        print(f"Missingness patterns: {n_patterns} unique patterns")
-        print(f"Complete cases: {n_complete}/{n_obs}")
+        print(f"Missing values: {np.isnan(data).sum()} ({np.isnan(data).mean():.1%})")
     
-    # Select backend and method
-    selected_backend, selected_method = _backend_method_selection(
+    # Step 2: Analyze missingness patterns
+    patterns = analyze_patterns(data)
+    
+    if verbose:
+        print(f"Missingness patterns: {len(patterns)} unique patterns")
+        complete_cases = sum(1 for p in patterns if len(p.missing_indices) == 0)
+        print(f"Complete cases: {patterns[0].n_cases if patterns and len(patterns[0].missing_indices) == 0 else 0}/{n_obs}")
+    
+    # Step 3: Select backend and method
+    selected_backend, selected_method, backend_obj = _backend_method_selection(
         backend, method, gpu64, verbose
     )
     
-    # FIXED: Create objective using factory function
+    # Step 4: Create objective function based on backend
     try:
-        from pymvnmle._objectives import get_objective
+        # Determine which objective to use based on backend
+        backend_name = backend_obj.name if hasattr(backend_obj, 'name') else 'numpy_fp64'
         
-        if 'gpu' in selected_backend:
-            # Determine precision from backend name
-            if 'fp64' in selected_backend:
-                objective = get_objective(data, backend='gpu', precision='fp64')
-                if verbose:
-                    print("Using GPU objective with fp64 precision")
+        if 'pytorch' in backend_name or 'gpu' in backend_name:
+            # GPU backend - determine precision
+            precision = backend_obj.precision if hasattr(backend_obj, 'precision') else 'fp32'
+            
+            if 'gpu' in selected_backend:
+                precision = 'fp64' if 'fp64' in selected_backend else 'fp32'
+                objective = get_objective(data, backend='gpu', precision=precision)
             else:
-                objective = get_objective(data, backend='gpu', precision='fp32')
-                if verbose:
-                    print("Using GPU objective with fp32 precision")
-                    
-            # Verify GPU is actually being used
-            if hasattr(objective, 'get_device_info'):
-                device_info = objective.get_device_info()
-                if verbose:
-                    print(f"GPU device: {device_info.get('gpu_name', 'Unknown')}")
-                    mem_allocated = device_info.get('memory_allocated', 0)
-                    if mem_allocated > 0:
-                        print(f"GPU memory allocated: {mem_allocated / 1024**2:.1f} MB")
+                objective = get_objective(data, backend='cpu')
+
+            if verbose:
+                print(f"Using GPU objective with {precision} precision")
+                
         else:
             # CPU backend
-            objective = get_objective(data, backend='cpu')
+            from pymvnmle._objectives.cpu_fp64_objective import CPUObjectiveFP64
+            objective = CPUObjectiveFP64(data)
+            
             if verbose:
                 print("Using CPU objective with fp64 precision")
                 
@@ -222,8 +221,8 @@ def mlest(
         # Fallback to CPU if GPU objective not available
         if verbose:
             print(f"GPU objective not available: {e}, falling back to CPU")
-        from pymvnmle._objectives import get_objective
-        objective = get_objective(data, backend='cpu')
+        from pymvnmle._objectives.cpu_fp64_objective import CPUObjectiveFP64
+        objective = CPUObjectiveFP64(data)
         selected_backend = 'cpu'  # Update for result
     except Exception as e:
         raise RuntimeError(f"Failed to create objective: {e}")
@@ -236,101 +235,139 @@ def mlest(
         print(f"Max iterations: {max_iter}")
         print("-" * 60)
     
-    # Get initial parameters
-    theta_init = objective.get_initial_parameters()
+    # Step 5: Get initial parameters
+    x0 = objective.get_initial_parameters()
     
-    # Run optimization
+    # Step 6: Run scipy optimization
     if verbose:
         print("Starting optimization...")
     
-    result = optimize_with_scipy(
-        objective=objective,
-        theta_init=theta_init,
-        method=selected_method,
-        tol=tol,
-        max_iter=max_iter,
-        verbose=verbose
-    )
+    # Check for Hessian availability
+    has_hessian = hasattr(objective, 'compute_hessian')
     
-    # Extract final parameters
-    mu_final, sigma_final, loglik = objective.extract_parameters(result.x)
-    
-    # Compute final gradient for diagnostics
+    # Validate method
     try:
-        grad_final = objective.compute_gradient(result.x)
-        grad_norm = np.linalg.norm(grad_final)
-    except:
-        grad_final = result.jac if hasattr(result, 'jac') else None
-        grad_norm = np.linalg.norm(grad_final) if grad_final is not None else np.nan
+        validated_method = validate_method(selected_method, selected_backend, has_hessian)
+    except ValueError as e:
+        # Auto-select if validation fails
+        if verbose:
+            print(f"Method validation failed: {e}")
+            print("Auto-selecting appropriate method...")
+        validated_method = auto_select_method(
+            backend=selected_backend,
+            has_hessian=has_hessian,
+            problem_size=(n_obs, n_vars),
+            precision='fp64' if selected_backend == 'cpu' else 'fp32'
+        )
+        if verbose:
+            print(f"Selected method: {validated_method}")
+    
+    # Run optimization
+    try:
+        result = optimize_with_scipy(
+            objective_fn=objective.compute_objective,
+            gradient_fn=objective.compute_gradient,
+            hessian_fn=objective.compute_hessian if has_hessian else None,
+            x0=x0,
+            method=validated_method,
+            max_iter=max_iter,
+            tol=tol,
+            verbose=verbose
+        )
+        
+    except Exception as e:
+        raise RuntimeError(f"Optimization failed: {e}")
+    
+    # Step 7: Extract final parameters
+    mu_final, sigma_final, _ = objective.extract_parameters(result['x'])
+    
+    # Compute final log-likelihood (negative of objective / 2 for R convention)
+    final_loglik = -result['fun'] / 2.0
     
     # Total computation time
     computation_time = time.time() - start_time
     
     if verbose:
         print("-" * 60)
-        print("Optimization Complete:")
-        print(f"  Converged: {result.success}")
-        print(f"  Iterations: {result.nit}")
-        print(f"  Function evaluations: {result.nfev}")
-        if hasattr(result, 'njev'):
-            print(f"  Gradient evaluations: {result.njev}")
-        print(f"  Final gradient norm: {grad_norm:.2e}")
-        print(f"  Log-likelihood: {loglik:.6f}")
+        print(f"Optimization Complete:")
+        print(f"  Converged: {result['converged']}")
+        print(f"  Iterations: {result['n_iter']}")
+        print(f"  Function evaluations: {result['n_fev']}")
+        if result['n_jev']:
+            print(f"  Gradient evaluations: {result['n_jev']}")
+        print(f"  Final gradient norm: {result['grad_norm']:.2e}")
+        print(f"  Log-likelihood: {final_loglik:.6f}")
         print(f"  Computation time: {computation_time:.3f}s")
         print("-" * 60)
     
-    # Create result object
-    ml_result = MLResult(
+    # Step 8: Create and return result object
+    return MLResult(
         muhat=mu_final,
         sigmahat=sigma_final,
-        loglik=loglik,
-        n_iter=result.nit,
-        converged=result.success,
+        loglik=final_loglik,
+        n_iter=result['n_iter'],
+        converged=result['converged'],
         computation_time=computation_time,
         backend=selected_backend,
-        method=selected_method,
+        method=validated_method,
         patterns=patterns,
         n_obs=n_obs,
         n_vars=n_vars,
-        n_missing=n_missing,
-        grad_norm=grad_norm,
-        message=result.message if hasattr(result, 'message') else ""
+        n_missing=np.isnan(data).sum(),
+        grad_norm=result['grad_norm'],
+        message=result['message']
     )
+
+
+def _validate_input(data: np.ndarray) -> np.ndarray:
+    """
+    Validate and prepare input data.
     
-    return ml_result
-
-
-# Backward compatibility aliases
-ml_estimate = mlest
-maximum_likelihood_estimate = mlest
-
-
-def run_validation():
-    """Quick validation against reference datasets."""
-    from pymvnmle import datasets
+    Parameters
+    ----------
+    data : np.ndarray
+        Input data matrix
+        
+    Returns
+    -------
+    np.ndarray
+        Validated data as float64 array
+        
+    Raises
+    ------
+    ValueError
+        If data is invalid
+    """
+    # Convert to numpy array if needed
+    data = np.asarray(data, dtype=np.float64)
     
-    print("\n" + "="*70)
-    print("PYMVNMLE VALIDATION")
-    print("="*70)
+    # Check dimensions
+    if data.ndim != 2:
+        raise ValueError(f"Data must be 2-dimensional, got shape {data.shape}")
     
-    # Test Apple dataset
-    print("\n📊 Apple Dataset:")
-    result = mlest(datasets.apple, verbose=False)
-    print(f"  Log-likelihood: {result.loglik:.6f}")
-    print(f"  Converged: {result.converged}")
-    print(f"  Backend: {result.backend}")
+    n_obs, n_vars = data.shape
     
-    # Expected R values
-    r_loglik = -74.217476
-    diff = abs(result.loglik - r_loglik)
-    if diff < 1e-5:
-        print(f"  ✅ Matches R reference (diff: {diff:.2e})")
-    else:
-        print(f"  ⚠️ Differs from R reference (diff: {diff:.2e})")
+    if n_obs < 2:
+        raise ValueError(f"Need at least 2 observations, got {n_obs}")
     
-    return result
-
-
-if __name__ == "__main__":
-    # Run validation if executed directly
-    run_validation()
+    if n_vars < 1:
+        raise ValueError(f"Need at least 1 variable, got {n_vars}")
+    
+    # Check for all missing
+    if np.isnan(data).all():
+        raise ValueError("All data values are missing")
+    
+    # Check for all missing in any variable
+    for j in range(n_vars):
+        if np.isnan(data[:, j]).all():
+            raise ValueError(f"Variable {j} has all missing values")
+    
+    # Check for at least one complete case (for initial values)
+    complete_cases = ~np.isnan(data).any(axis=1)
+    if not complete_cases.any():
+        warnings.warn(
+            "No complete cases found. Initial values may be poor.",
+            RuntimeWarning
+        )
+    
+    return data

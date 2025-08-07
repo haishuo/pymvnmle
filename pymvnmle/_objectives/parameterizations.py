@@ -42,6 +42,8 @@ class CovarianceParameterization(ABC):
         """
         Get initial parameter vector from sample statistics.
         
+        NO REGULARIZATION HERE - let objectives handle it.
+        
         Parameters
         ----------
         sample_mean : np.ndarray
@@ -54,11 +56,7 @@ class CovarianceParameterization(ABC):
         np.ndarray
             Initial parameter vector
         """
-        # Regularize covariance for positive definiteness
-        epsilon = 0.01
-        regularized_cov = sample_cov + epsilon * np.eye(self.n_vars)
-        
-        return self.pack(sample_mean, regularized_cov)
+        return self.pack(sample_mean, sample_cov)
 
 
 class InverseCholeskyParameterization(CovarianceParameterization):
@@ -66,7 +64,7 @@ class InverseCholeskyParameterization(CovarianceParameterization):
     Inverse Cholesky parameterization (R-compatible).
     
     Parameters: [μ, log(diag(Δ)), off-diag(Δ)]
-    where Σ = (Δ^{-1})^T Δ^{-1} and Δ is lower triangular.
+    where Σ = (Δ^{-1})^T Δ^{-1} and Δ is upper triangular.
     
     This matches R's mvnmle package exactly.
     """
@@ -80,10 +78,11 @@ class InverseCholeskyParameterization(CovarianceParameterization):
         # Extract parameters
         log_diag = np.log(np.diag(delta))
         
-        # Extract lower triangular elements (column-wise, R style)
+        # Extract UPPER triangular elements (column-wise, R style)
+        # Delta is upper triangular, so we extract i < j
         tril_elements = []
         for j in range(self.n_vars):
-            for i in range(j + 1, self.n_vars):
+            for i in range(j):  # i < j for upper triangle
                 tril_elements.append(delta[i, j])
         
         return np.concatenate([mu, log_diag, tril_elements])
@@ -92,7 +91,7 @@ class InverseCholeskyParameterization(CovarianceParameterization):
         """Unpack from inverse Cholesky parameters."""
         mu = theta[:self.n_vars]
         
-        # Reconstruct Δ matrix
+        # Reconstruct Δ matrix (upper triangular)
         delta = np.zeros((self.n_vars, self.n_vars))
         
         # Diagonal elements
@@ -101,7 +100,7 @@ class InverseCholeskyParameterization(CovarianceParameterization):
         # Off-diagonal elements (column-wise, R style)
         idx = 2 * self.n_vars
         for j in range(self.n_vars):
-            for i in range(j + 1, self.n_vars):
+            for i in range(j):  # i < j for upper triangle
                 delta[i, j] = theta[idx]
                 idx += 1
         
@@ -139,13 +138,13 @@ class CholeskyParameterization(CovarianceParameterization):
         """Unpack from Cholesky parameters."""
         mu = theta[:self.n_vars]
         
-        # Reconstruct L matrix
+        # Reconstruct L matrix (lower triangular)
         L = np.zeros((self.n_vars, self.n_vars))
         
         # Diagonal elements
         np.fill_diagonal(L, np.exp(theta[self.n_vars:2*self.n_vars]))
         
-        # Off-diagonal elements
+        # Off-diagonal elements (lower triangle)
         idx = 2 * self.n_vars
         tril_idx = np.tril_indices(self.n_vars, k=-1)
         if len(tril_idx[0]) > 0:
@@ -251,26 +250,6 @@ class BoundedCholeskyParameterization(CovarianceParameterization):
         sigma = L @ L.T
         
         return mu, sigma
-    
-    def get_initial_parameters(self, sample_mean: np.ndarray,
-                              sample_cov: np.ndarray) -> np.ndarray:
-        """Get initial parameters with bounds enforced."""
-        # Clip eigenvalues to ensure bounds
-        eigvals, eigvecs = np.linalg.eigh(sample_cov)
-        eigvals = np.clip(eigvals, self.var_min, self.var_max)
-        bounded_cov = eigvecs @ np.diag(eigvals) @ eigvecs.T
-        
-        # Ensure correlations are within bounds
-        D = np.diag(1 / np.sqrt(np.diag(bounded_cov)))
-        corr_matrix = D @ bounded_cov @ D
-        corr_matrix = np.clip(corr_matrix, -self.corr_max, self.corr_max)
-        np.fill_diagonal(corr_matrix, 1.0)
-        
-        # Reconstruct covariance
-        D_inv = np.diag(np.sqrt(np.diag(bounded_cov)))
-        bounded_cov = D_inv @ corr_matrix @ D_inv
-        
-        return self.pack(sample_mean, bounded_cov)
 
 
 class MatrixLogParameterization(CovarianceParameterization):
@@ -300,13 +279,15 @@ class MatrixLogParameterization(CovarianceParameterization):
         
         mu = theta[:self.n_vars]
         
-        # Reconstruct symmetric log matrix
+        # Reconstruct log(Σ)
         log_sigma = np.zeros((self.n_vars, self.n_vars))
         tril_idx = np.tril_indices(self.n_vars)
         log_sigma[tril_idx] = theta[self.n_vars:]
+        
+        # Make symmetric
         log_sigma = log_sigma + log_sigma.T - np.diag(np.diag(log_sigma))
         
-        # Matrix exponential
+        # Compute Σ = exp(log(Σ))
         sigma = expm(log_sigma)
         
         return mu, sigma
@@ -314,39 +295,41 @@ class MatrixLogParameterization(CovarianceParameterization):
 
 def get_parameterization(name: str, n_vars: int, **kwargs) -> CovarianceParameterization:
     """
-    Factory function for parameterizations.
+    Factory function for creating parameterizations.
     
     Parameters
     ----------
     name : str
-        Parameterization name: 'inverse_cholesky', 'cholesky', 'bounded_cholesky', 'matrix_log'
+        Name of parameterization ('inverse_cholesky', 'cholesky', 'bounded_cholesky', 'matrix_log')
     n_vars : int
         Number of variables
     **kwargs
-        Additional arguments for specific parameterizations
+        Additional parameters for specific parameterizations
         
     Returns
     -------
     CovarianceParameterization
         Parameterization instance
     """
-    if name == 'inverse_cholesky':
+    name_lower = name.lower()
+    
+    if name_lower in ['inverse_cholesky', 'inverse-cholesky', 'inv_chol']:
         return InverseCholeskyParameterization(n_vars)
-    elif name == 'cholesky':
+    elif name_lower in ['cholesky', 'chol']:
         return CholeskyParameterization(n_vars)
-    elif name == 'bounded_cholesky':
+    elif name_lower in ['bounded_cholesky', 'bounded-cholesky', 'bounded']:
         return BoundedCholeskyParameterization(n_vars, **kwargs)
-    elif name == 'matrix_log':
+    elif name_lower in ['matrix_log', 'matrix-log', 'logm']:
         return MatrixLogParameterization(n_vars)
     else:
         raise ValueError(f"Unknown parameterization: {name}")
 
 
-def convert_parameters(theta: np.ndarray,
-                      from_param: CovarianceParameterization,
-                      to_param: CovarianceParameterization) -> np.ndarray:
+def convert_parameters(theta: np.ndarray, 
+                       from_param: CovarianceParameterization,
+                       to_param: CovarianceParameterization) -> np.ndarray:
     """
-    Convert parameters between parameterizations.
+    Convert parameters between different parameterizations.
     
     Parameters
     ----------
@@ -362,5 +345,8 @@ def convert_parameters(theta: np.ndarray,
     np.ndarray
         Parameter vector in target parameterization
     """
+    # Unpack from source
     mu, sigma = from_param.unpack(theta)
+    
+    # Pack into target
     return to_param.pack(mu, sigma)

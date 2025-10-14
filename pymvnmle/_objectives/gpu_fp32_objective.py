@@ -275,7 +275,12 @@ class GPUObjectiveFP32(MLEObjectiveBase):
         S_k = (data_centered.T @ data_centered) / n_obs
         
         # Trace term: tr(Σ_k^-1 * S_k)
-        sigma_inv_S = torch.linalg.solve(sigma_k, S_k)
+        # Use Cholesky solve instead of general solve for MPS compatibility
+        # Σ_k^-1 * S_k solved via L @ L.T @ X = S_k
+        # First: L @ Y = S_k (forward substitution)
+        # Then: L.T @ X = Y (backward substitution)
+        Y = torch.linalg.solve_triangular(L_k, S_k, upper=False)
+        sigma_inv_S = torch.linalg.solve_triangular(L_k.T, Y, upper=True)
         trace_term = torch.trace(sigma_inv_S)
         
         # Total contribution: n_obs * [log|Σ| + tr(Σ^-1 S)]

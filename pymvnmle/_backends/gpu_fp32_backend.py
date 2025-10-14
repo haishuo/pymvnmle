@@ -50,8 +50,8 @@ class PyTorchBackendFP32(GPUBackendFP32):
                 "Install with: pip install torch"
             )
         
-        # Set default dtype to float32
-        self.torch.set_default_dtype(torch.float32)
+        # Note: We use explicit dtype=torch.float32 in all operations
+        # rather than setting a global default to avoid side effects
         
         # Select device
         self.device = self._select_device(device)
@@ -291,19 +291,42 @@ class PyTorchBackendFP32(GPUBackendFP32):
     
     def inv(self, matrix: Any) -> Any:
         """
-        Matrix inversion on GPU.
+        Matrix inversion on GPU using Cholesky for MPS compatibility.
         
         Parameters
         ----------
         matrix : torch.Tensor
-            Square matrix on GPU
+            Positive definite matrix on GPU
             
         Returns
         -------
         torch.Tensor
             Inverse matrix on GPU
         """
-        return self.torch.linalg.inv(matrix)
+        torch = self.torch
+        
+        # For positive definite matrices, use Cholesky inversion
+        # This avoids linalg.inv which uses LU decomposition (not supported on MPS)
+        try:
+            L = self.cholesky(matrix, upper=False)
+            
+            # Solve L @ L.T @ X = I for X
+            # First solve L @ Y = I
+            I = torch.eye(matrix.shape[0], device=self.device, dtype=torch.float32)
+            Y = self.solve_triangular(L, I, upper=False, trans='N')
+            
+            # Then solve L.T @ X = Y
+            X = self.solve_triangular(L, Y, upper=False, trans='T')
+            
+            return X
+        except:
+            # If Cholesky fails, matrix isn't positive definite
+            # Fall back to general inversion (may fail on MPS)
+            warnings.warn(
+                "Matrix inversion failed with Cholesky. "
+                "This operation may not work on Apple Metal (MPS)."
+            )
+            return torch.linalg.inv(matrix)
     
     def log_det(self, matrix: Any) -> float:
         """
@@ -377,21 +400,17 @@ class PyTorchBackendFP32(GPUBackendFP32):
         """
         torch = self.torch
         
-        try:
-            # Use Cholesky decomposition for efficiency
-            L = self.cholesky(A, upper=False)
-            
-            # Forward substitution
-            y = self.solve_triangular(L, b, upper=False, trans='N')
-            
-            # Back substitution
-            x = self.solve_triangular(L, y, upper=False, trans='T')
-            
-            return x
-            
-        except torch.linalg.LinAlgError:
-            # Fallback to general solver
-            return torch.linalg.solve(A, b)
+        # ALWAYS use Cholesky decomposition for MPS compatibility
+        # MPS doesn't support linalg.solve (uses unsupported linalg_lu_solve)
+        L = self.cholesky(A, upper=False)
+        
+        # Forward substitution
+        y = self.solve_triangular(L, b, upper=False, trans='N')
+        
+        # Back substitution
+        x = self.solve_triangular(L, y, upper=False, trans='T')
+        
+        return x
     
     def supports_autodiff(self) -> bool:
         """PyTorch supports automatic differentiation."""

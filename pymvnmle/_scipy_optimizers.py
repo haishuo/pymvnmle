@@ -291,8 +291,8 @@ def auto_select_method(
     is_large = n_params > 1000
     
     if precision == 'fp32' or backend == 'gpu_fp32':
-        # FP32: Use BFGS or L-BFGS-B
-        return 'L-BFGS-B' if is_large else 'BFGS'
+        # FP32: ALWAYS use L-BFGS-B (BFGS fails with float32 gradient noise)
+        return 'L-BFGS-B'
     
     elif has_hessian and n_params < 500:
         # Small problem with Hessian: Newton-CG for fast convergence

@@ -95,12 +95,13 @@ def _select_optimizer_config(backend: str, precision: str, method: Optional[str]
     
     if backend == 'gpu' and precision == 'fp32':
         # FP32 GPU needs bounded optimization for stability
+        # Use relaxed tolerances appropriate for float32 precision
         return {
             'method': 'L-BFGS-B',
             'options': {
-                'maxiter': 100,
-                'gtol': 1e-5,
-                'ftol': 1e-9
+                'maxiter': 200,  # FP32 may need more iterations
+                'gtol': 1e-3,    # Relaxed for FP32 gradient noise (~1e-6)
+                'ftol': 1e-4     # Function tolerance for FP32
             },
             'use_bounds': True
         }
